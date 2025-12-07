@@ -191,6 +191,10 @@ class FPLAPIClient:
             if not current_gw:
                 current_gw = 1
             
+            # Get manager history (chips usage, etc.)
+            history_url = f"{self.base_url}/entry/{manager_id}/history/"
+            history_data = self._make_request(history_url) or {}
+            
             # Get manager's team for current gameweek
             team_url = f"{self.base_url}/entry/{manager_id}/event/{current_gw}/picks/"
             team_data = self._make_request(team_url)
@@ -203,8 +207,9 @@ class FPLAPIClient:
             teams_map = {t['id']: t['name'] for t in bootstrap_data.get('teams', [])}
             positions_map = {pt['id']: pt['singular_name'] for pt in bootstrap_data.get('element_types', [])}
             
+            picks = team_data.get('picks', [])
             team_players = []
-            for pick in team_data.get('picks', []):
+            for pick in picks:
                 player_id = pick['element']
                 player_data = players_map.get(player_id)
                 
@@ -215,6 +220,7 @@ class FPLAPIClient:
                         'first_name': player_data['first_name'],
                         'second_name': player_data['second_name'],
                         'position': positions_map.get(player_data['element_type'], 'MID'),
+                        'team': player_data.get('team'),
                         'team_name': teams_map.get(player_data['team'], 'Unknown'),
                         'now_cost': player_data['now_cost'],
                         'total_points': player_data['total_points'],
@@ -233,8 +239,46 @@ class FPLAPIClient:
                         'status': player_data.get('status', 'a'),
                         'chance_of_playing_this_round': player_data.get('chance_of_playing_this_round'),
                         'chance_of_playing_next_round': player_data.get('chance_of_playing_next_round'),
-                        'news': player_data.get('news', '')
+                        'news': player_data.get('news', ''),
+                        'pick_position': pick.get('position'),
+                        'multiplier': pick.get('multiplier'),
+                        'is_captain': pick.get('is_captain'),
+                        'is_vice_captain': pick.get('is_vice_captain')
                     })
+            
+            entry_history = team_data.get('entry_history', {}) or {}
+            bank_raw = entry_history.get('bank')
+            bank_value = round(bank_raw / 10, 1) if isinstance(bank_raw, (int, float)) else 0.0
+            
+            squad_value_raw = entry_history.get('value')
+            squad_value = round(squad_value_raw / 10, 1) if isinstance(squad_value_raw, (int, float)) else None
+            
+            starting_xi = [pick['element'] for pick in picks if pick.get('position', 0) <= 11]
+            
+            chip_name_map = {
+                'wildcard': 'Wildcard',
+                'freehit': 'Free Hit',
+                '3xc': 'Triple Captain',
+                'bboost': 'Bench Boost'
+            }
+            used_chips = set()
+            for chip in history_data.get('chips', []):
+                chip_name = chip.get('name')
+                mapped = chip_name_map.get(chip_name)
+                if mapped:
+                    used_chips.add(mapped)
+            
+            default_chips = ['Wildcard', 'Bench Boost', 'Triple Captain', 'Free Hit']
+            chips_available = [chip for chip in default_chips if chip not in used_chips]
+            
+            active_chip_raw = team_data.get('active_chip')
+            active_chip = chip_name_map.get(active_chip_raw, active_chip_raw)
+            
+            free_transfers = entry_data.get('last_deadline_total_transfers')
+            if free_transfers is None:
+                free_transfers = entry_history.get('event_transfers')  # fallback
+            if free_transfers is None:
+                free_transfers = 1
             
             return {
                 "manager_id": manager_id,
@@ -242,11 +286,56 @@ class FPLAPIClient:
                 "team_name": entry_data.get('name', ''),
                 "overall_rank": entry_data.get('summary_overall_rank'),
                 "total_points": entry_data.get('summary_overall_points'),
-                "players": team_players
+                "players": team_players,
+                "starting_xi": starting_xi,
+                "bank": bank_value,
+                "squad_value": squad_value,
+                "free_transfers": free_transfers,
+                "chips_available": chips_available,
+                "active_chip": active_chip
             }
             
         except Exception as e:
             self.logger.error(f"Error fetching team for manager {manager_id}: {str(e)}")
+            return None
+    
+    def get_manager_entry(self, manager_id: str) -> Optional[Dict]:
+        """
+        Get manager entry data by ID
+        Uses: https://fantasy.premierleague.com/api/entry/{manager_id}/
+        """
+        try:
+            entry_url = f"{self.base_url}/entry/{manager_id}/"
+            entry_data = self._make_request(entry_url)
+            return entry_data
+        except Exception as e:
+            self.logger.error(f"Error fetching manager entry {manager_id}: {str(e)}")
+            return None
+
+    def get_manager_history(self, manager_id: str) -> Optional[Dict]:
+        """
+        Get manager season history, chips and transfers.
+        Uses: https://fantasy.premierleague.com/api/entry/{manager_id}/history/
+        """
+        try:
+            history_url = f"{self.base_url}/entry/{manager_id}/history/"
+            return self._make_request(history_url)
+        except Exception as e:
+            self.logger.error(f"Error fetching manager history {manager_id}: {str(e)}")
+            return None
+
+    def get_manager_event_picks(self, manager_id: str, event: int) -> Optional[Dict]:
+        """
+        Get manager picks for a specific gameweek.
+        Uses: https://fantasy.premierleague.com/api/entry/{manager_id}/event/{event}/picks/
+        """
+        try:
+            picks_url = f"{self.base_url}/entry/{manager_id}/event/{event}/picks/"
+            return self._make_request(picks_url)
+        except Exception as e:
+            self.logger.error(
+                f"Error fetching manager {manager_id} picks for event {event}: {str(e)}"
+            )
             return None
     
     def get_manager_by_team_name(self, team_name: str) -> Optional[str]:
@@ -257,4 +346,17 @@ class FPLAPIClient:
         # This would require scraping or unofficial APIs
         # For now, return None
         return None
+    
+    def get_classic_league_page(self, league_id: int, page: int = 1) -> Optional[Dict]:
+        """Fetch a single classic league standings page"""
+        try:
+            url = f"{self.base_url}/leagues-classic/{league_id}/standings/"
+            params = {'page_standings': page}
+            self._rate_limit()
+            response = self.session.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as exc:
+            self.logger.error(f"Error fetching league {league_id} page {page}: {exc}")
+            return None
 

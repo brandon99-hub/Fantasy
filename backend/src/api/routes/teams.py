@@ -1,36 +1,25 @@
 """Team-related API endpoints"""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from typing import List, Dict, Any
 import logging
 
-from backend.src.core.database import FPLDatabase
+from backend.src.core.async_db import AsyncDatabaseWrapper, get_async_db
 from backend.src.utils.serialization import convert_numpy_types
 from backend.src.schemas.models import TeamValidationRequest, TeamValidationResponse
+from backend.src.core.cache import cache_result
 
 router = APIRouter(prefix="/api", tags=["teams"])
-db = FPLDatabase()
 logger = logging.getLogger(__name__)
-
-# Server-side cache
-teams_cache = None
-
-def get_cached_teams():
-    global teams_cache
-    if teams_cache is None:
-        teams_cache = db.get_teams()
-    return teams_cache
-
-def clear_cache():
-    global teams_cache
-    teams_cache = None
 
 
 @router.get("/teams")
-async def get_teams() -> List[Dict[str, Any]]:
+@cache_result(key_prefix="teams")
+async def get_teams(db: AsyncDatabaseWrapper = Depends(get_async_db)) -> List[Dict[str, Any]]:
     """Get all teams"""
     try:
-        teams_df = get_cached_teams()
+        # Async database call
+        teams_df = await db.get_teams()
         
         if teams_df.empty:
             raise HTTPException(status_code=404, detail="No team data available")
@@ -44,10 +33,14 @@ async def get_teams() -> List[Dict[str, Any]]:
 
 
 @router.post("/team/validate", response_model=TeamValidationResponse)
-async def validate_team(request: TeamValidationRequest):
+async def validate_team(
+    request: TeamValidationRequest,
+    db: AsyncDatabaseWrapper = Depends(get_async_db)
+):
     """Validate team structure and constraints"""
     try:
-        players_df = db.get_players_with_stats()
+        # Async database call
+        players_df = await db.get_players_with_stats()
         team_players = players_df[players_df['id'].isin(request.player_ids)]
         
         validation = {

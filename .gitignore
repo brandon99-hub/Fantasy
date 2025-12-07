@@ -1,4 +1,6 @@
+# ============================================
 # Python
+# ============================================
 __pycache__/
 *.py[cod]
 *$py.class
@@ -16,6 +18,7 @@ parts/
 sdist/
 var/
 wheels/
+share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -25,78 +28,234 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 
-# Virtual Environment
+# Installer logs
+pip-selfcheck.json
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# ============================================
+# Virtual Environments
+# ============================================
 venv/
 ENV/
 env/
-.venv
+.venv/
+env.bak/
+venv.bak/
+pythonenv*/
 
-# IDEs
+# ============================================
+# IDEs & Editors
+# ============================================
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-.DS_Store
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+*.sublime-project
 
-# Environment variables
+# ============================================
+# OS-Specific
+# ============================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ============================================
+# Environment Variables
+# ============================================
 .env
 .env.local
+.env.development.local
+.env.test.local
+.env.production.local
 .env.*.local
+.envrc
 
-# Database
+# ============================================
+# Database Files
+# ============================================
 *.db
 *.sqlite
 *.sqlite3
+*.db-shm
+*.db-wal
 backend/data/*.db
+fpl.db
+celerybeat-schedule
+celerybeat-schedule.db
 
+# PostgreSQL
+*.dump
+*.sql.gz
+
+# ============================================
 # Logs
+# ============================================
 *.log
 logs/
 backend/logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
 
-# ML Models
+# ============================================
+# ML Models & Data
+# ============================================
 backend/data/models/
 *.pkl
 *.pickle
 *.joblib
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.onnx
+*.tflite
 
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-.hypothesis/
+# Data files (uncomment if needed)
+# *.csv
+# *.json
+# *.parquet
 
+# ============================================
 # Jupyter Notebook
+# ============================================
 .ipynb_checkpoints
+*.ipynb_checkpoints/
+profile_default/
+ipython_config.py
 
+# ============================================
 # Documentation
+# ============================================
 docs/_build/
+docs/_static/
+docs/_templates/
+site/
+.doctrees/
 
-# Frontend
+# ============================================
+# Frontend (Next.js / React)
+# ============================================
+# Dependencies
 frontend/node_modules/
+fpl-optimizer-frontend/node_modules/
+node_modules/
+
+# Next.js
 frontend/.next/
 frontend/out/
 frontend/build/
 frontend/dist/
 frontend/.turbo/
-fpl-optimizer-frontend/node_modules/
 fpl-optimizer-frontend/.next/
 fpl-optimizer-frontend/out/
 fpl-optimizer-frontend/build/
+.next/
+out/
+.turbo/
 
-# Package managers
+# Production
+/build
+/dist
+
+# Vercel
+.vercel
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# ============================================
+# Package Managers
+# ============================================
 package-lock.json
 yarn.lock
 pnpm-lock.yaml
+.pnp
+.pnp.js
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
 
-# Misc
+# ============================================
+# Caching & Temporary Files
+# ============================================
 .cache/
+.parcel-cache/
+.npm
+.eslintcache
+.stylelintcache
+.rpt2_cache/
+.rts2_cache_cjs/
+.rts2_cache_es/
+.rts2_cache_umd/
 temp/
 tmp/
 *.tmp
+*.temp
+.temp/
 
+# ============================================
+# Replit & Cloud IDEs
+# ============================================
+.replit
+.local/
+.upm/
+.config/
+replit.nix
+
+# ============================================
+# Streamlit
+# ============================================
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+# ============================================
+# Docker
+# ============================================
+# Uncomment if you want to ignore docker files
+# docker-compose.override.yml
+# .dockerignore
+
+# ============================================
+# Celery
+# ============================================
+celerybeat-schedule
+celerybeat.pid
+
+# ============================================
+# Project-Specific
+# ============================================
 # Old version folders (cleanup)
 0.*/
 1.*/
@@ -107,6 +266,11 @@ tmp/
 
 # Attached assets
 attached_assets/
+
+# Backup directories
+old_files_backup/
+backups/
+backup/
 
 # Test files in root
 test_*.py
@@ -120,4 +284,9 @@ test_imports.py
 # Old files
 old_*.py
 backup_*.py
+*.bak
+*.backup
 
+# Misc
+.local
+*.orig

@@ -78,6 +78,12 @@ class ManagerTeamResponse(BaseModel):
     overall_rank: Optional[int] = None
     total_points: Optional[int] = None
     players: List[Dict[str, Any]]
+    starting_xi: List[int]
+    bank: float
+    squad_value: Optional[float] = None
+    free_transfers: int
+    chips_available: List[str]
+    active_chip: Optional[str] = None
 
 
 class TeamAnalysisRequest(BaseModel):
@@ -110,7 +116,7 @@ class AdvancedOptimizeRequest(BaseModel):
     starting_xi: Optional[List[int]] = Field(default=None, max_length=11)
     budget: float = Field(default=100.0, ge=0.0, le=200.0)
     bank_amount: float = Field(default=0.0, ge=0.0, le=20.0)
-    free_transfers: int = Field(default=1, ge=0, le=15)
+    free_transfers: int = Field(default=1, ge=0, le=20)
     use_wildcard: bool = False
     chips_available: List[str] = Field(default_factory=lambda: ['Wildcard', 'Bench Boost', 'Triple Captain', 'Free Hit'])
     formation: str = "3-4-3"
@@ -125,6 +131,7 @@ class AdvancedOptimizeResponse(BaseModel):
     optimization_success: bool
     team_optimization: Dict[str, Any] = Field(default_factory=dict)
     team_analysis: Dict[str, Any] = Field(default_factory=dict)
+    bench_analysis: Dict[str, Any] = Field(default_factory=dict)
     fixture_analysis: Dict[str, Any] = Field(default_factory=dict)
     price_analysis: Dict[str, Any] = Field(default_factory=dict)
     strategic_planning: Dict[str, Any] = Field(default_factory=dict)
@@ -164,5 +171,40 @@ class TrainModelsResponse(BaseModel):
 class HealthCheckResponse(BaseModel):
     """Health check response"""
     status: str
+    message: str
+
+
+class CrawlStartRequest(BaseModel):
+    """Request to start a crawl"""
+    start_id: int = Field(default=1, ge=1, description="Starting manager ID")
+    end_id: Optional[int] = Field(default=None, ge=1, description="Ending manager ID (None for unlimited)")
+    batch_size: Optional[int] = Field(default=None, ge=1, le=1000, description="Batch size for processing")
+
+
+class LeagueCrawlRequest(BaseModel):
+    """Request to crawl a classic league"""
+    league_id: int = Field(..., ge=1, description="FPL classic league ID")
+    max_pages: Optional[int] = Field(default=None, ge=1, le=2000, description="Max league pages to fetch")
+    start_page: int = Field(default=1, ge=1, description="Starting standings page")
+
+
+class SeedLeaguesRequest(BaseModel):
+    """Request to seed configured leagues"""
+    league_ids: Optional[List[int]] = Field(default=None, description="Override list of league IDs")
+    max_pages: Optional[int] = Field(default=None, ge=1, le=2000)
+
+
+class CrawlStatusResponse(BaseModel):
+    """Crawler status response"""
+    running: bool
+    paused: bool
+    progress: Optional[Dict[str, Any]] = None
+    manager_count: int
+    message: str
+
+
+class CrawlControlResponse(BaseModel):
+    """Crawler control response"""
+    success: bool
     message: str
 

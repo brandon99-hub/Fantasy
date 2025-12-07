@@ -9,6 +9,8 @@ from typing import Dict, List, Optional, Tuple
 import logging
 from dataclasses import dataclass
 
+from backend.src.core.manager_training_data import ManagerTrainingDataBuilder
+
 @dataclass
 class EOAnalysis:
     player_id: int
@@ -25,6 +27,7 @@ class EffectiveOwnershipTracker:
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
+        self._manager_meta_builder = ManagerTrainingDataBuilder()
         
         # Ownership thresholds
         self.ownership_thresholds = {
@@ -42,28 +45,105 @@ class EffectiveOwnershipTracker:
             'differential': 'High Risk'
         }
     
-    def calculate_effective_ownership(self, 
-                                    players_df: pd.DataFrame,
-                                    top_managers_df: pd.DataFrame = None) -> pd.DataFrame:
+    def calculate_effective_ownership(
+        self,
+        players_df: pd.DataFrame,
+        top_managers_df: pd.DataFrame = None,
+    ) -> pd.DataFrame:
         """Calculate effective ownership for players"""
         try:
             if players_df.empty:
                 return pd.DataFrame()
             
             # Start with basic ownership
-            eo_data = players_df[['id', 'web_name', 'position', 'selected_by_percent']].copy()
-            eo_data['effective_ownership'] = eo_data['selected_by_percent']
-            
-            # If we have top managers data, calculate weighted EO
+            eo_data = players_df[
+                ["id", "web_name", "position", "selected_by_percent"]
+            ].copy()
+
+            # Merge top cohort metrics if available
             if top_managers_df is not None and not top_managers_df.empty:
                 eo_data = self._calculate_weighted_eo(eo_data, top_managers_df)
+            else:
+                # Try to derive from manager history tables
+                try:
+                    meta = self._manager_meta_builder.build_player_meta_features(force_refresh=False)
+                    if not meta.empty:
+                        # If players_df has a gameweek column, align on it; otherwise, use latest event
+                        event_col = None
+                        for candidate in ("event", "gameweek", "round"):
+                            if candidate in players_df.columns:
+                                event_col = candidate
+                                break
+
+                        if event_col is not None:
+                            latest_meta = (
+                                meta.sort_values("event")
+                                .groupby(["player_id", "event"])
+                                .tail(1)
+                            )
+                            # Ensure player_id is int64 to match id column
+                            if 'player_id' in latest_meta.columns:
+                                latest_meta = latest_meta.copy()
+                                latest_meta['player_id'] = pd.to_numeric(latest_meta['player_id'], errors='coerce').astype('Int64')
+                            eo_data = eo_data.merge(
+                                latest_meta[
+                                    [
+                                        "player_id",
+                                        "event",
+                                        "top_cohort_ownership_pct",
+                                        "top_cohort_captain_pct",
+                                    ]
+                                ],
+                                left_on=["id", event_col],
+                                right_on=["player_id", "event"],
+                                how="left",
+                            )
+                        else:
+                            latest_meta = (
+                                meta.sort_values("event")
+                                .groupby("player_id")
+                                .tail(1)
+                            )
+                            # Ensure player_id is int64 to match id column
+                            if 'player_id' in latest_meta.columns:
+                                latest_meta = latest_meta.copy()
+                                latest_meta['player_id'] = pd.to_numeric(latest_meta['player_id'], errors='coerce').astype('Int64')
+                            eo_data = eo_data.merge(
+                                latest_meta[
+                                    [
+                                        "player_id",
+                                        "top_cohort_ownership_pct",
+                                        "top_cohort_captain_pct",
+                                    ]
+                                ],
+                                left_on="id",
+                                right_on="player_id",
+                                how="left",
+                            )
+
+                        eo_data["effective_ownership"] = eo_data[
+                            "top_cohort_ownership_pct"
+                        ].fillna(eo_data["selected_by_percent"])
+                        # Drop helper keys
+                        for col in ("player_id", "event"):
+                            if col in eo_data.columns:
+                                eo_data.drop(columns=[col], inplace=True)
+                    else:
+                        eo_data["effective_ownership"] = eo_data["selected_by_percent"]
+                except Exception as exc:
+                    self.logger.error(
+                        f"Error deriving EO from manager history tables: {exc}"
+                    )
+                    eo_data["effective_ownership"] = eo_data["selected_by_percent"]
             
             # Classify ownership levels
-            eo_data['template_status'] = eo_data['selected_by_percent'].apply(self._classify_ownership)
-            eo_data['risk_level'] = eo_data['template_status'].map(self.risk_levels)
+            eo_data["template_status"] = eo_data["selected_by_percent"].apply(
+                self._classify_ownership
+            )
+            eo_data["risk_level"] = eo_data["template_status"].map(self.risk_levels)
             
             # Calculate differential value (inverse of ownership)
-            eo_data['differential_value'] = 100 - eo_data['selected_by_percent']
+            eo_data["differential_value"] = 100 - eo_data["selected_by_percent"]
             
             return eo_data
             

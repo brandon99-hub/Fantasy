@@ -1,273 +1,218 @@
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-try:
-    import lightgbm as lgb
-    HAS_LIGHTGBM = True
-except (ImportError, OSError):
-    lgb = None
-    HAS_LIGHTGBM = False
-import pickle
 import logging
+import pickle
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
+
+from backend.src.core.config import get_settings
+from backend.src.core.database import FPLDatabase
+from backend.src.core.training_data import TrainingDataBuilder
 from backend.src.models.minutes_model import MinutesPredictor
 
+
 class PointsPredictor:
-    """Predicts FPL points using minutes predictions and player features"""
-    
+    """Predicts FPL points using historical trends and minutes predictions."""
+
     def __init__(self):
-        self.regressor = None
+        self.regressor: Optional[GradientBoostingRegressor] = None
         self.feature_scaler = StandardScaler()
         self.minutes_model = MinutesPredictor()
         self.is_fitted = False
-        self.feature_names = []
-        
+        self.feature_names: List[str] = []
+        self.builder = TrainingDataBuilder(lookback_gws=5)
         self.logger = logging.getLogger(__name__)
-        
-        # Position-specific scoring patterns
+        self.settings = get_settings()
+        self.db = FPLDatabase()
+        self.model_version: Optional[str] = None
         self.position_weights = {
-            'GKP': {'clean_sheet': 4, 'save': 0.33, 'goals': 6, 'assists': 3},
-            'DEF': {'clean_sheet': 4, 'goals': 6, 'assists': 3},
-            'MID': {'clean_sheet': 1, 'goals': 5, 'assists': 3},
-            'FWD': {'goals': 4, 'assists': 3}
+            "GKP": {"clean_sheet": 4, "save": 0.33, "goals": 6, "assists": 3},
+            "DEF": {"clean_sheet": 4, "goals": 6, "assists": 3},
+            "MID": {"clean_sheet": 1, "goals": 5, "assists": 3},
+            "FWD": {"goals": 4, "assists": 3},
         }
-    
-    def _create_features(self, df: pd.DataFrame, minutes_predictions: pd.DataFrame = None) -> pd.DataFrame:
-        """Create features for points prediction"""
-        try:
-            features = df.copy()
-            
-            # Merge minutes predictions if provided
-            if minutes_predictions is not None and not minutes_predictions.empty:
-                features = features.merge(
-                    minutes_predictions[['player_id', 'expected_minutes', 'start_probability']],
-                    left_on='id', right_on='player_id', how='left'
-                )
-            else:
-                # Use actual minutes as fallback
-                features['expected_minutes'] = features.get('minutes', 0)
-                features['start_probability'] = (features.get('minutes', 0) > 60).astype(int)
-            
-            # Fill missing values
-            features['expected_minutes'] = features['expected_minutes'].fillna(0)
-            features['start_probability'] = features['start_probability'].fillna(0)
-            
-            # Basic scoring features
-            numeric_features = [
-                'form', 'total_points', 'points_per_game', 'goals_scored', 'assists',
-                'clean_sheets', 'bonus', 'bps', 'ict_index', 'influence', 
-                'creativity', 'threat', 'selected_by_percent'
-            ]
-            
-            for feature in numeric_features:
-                if feature in features.columns:
-                    features[feature] = pd.to_numeric(features[feature], errors='coerce').fillna(0)
-            
-            # Position encoding
-            if 'position' in features.columns:
-                position_dummies = pd.get_dummies(features['position'], prefix='pos')
-                features = pd.concat([features, position_dummies], axis=1)
-            
-            # Price as quality indicator
-            if 'now_cost' in features.columns:
-                features['price_value'] = features['now_cost'] / 10.0  # Convert to £m
-                features['value_ratio'] = features['total_points'] / (features['now_cost'] + 1)
-            
-            # Recent performance indicators
-            features['form_trend'] = features.get('form', 0)
-            features['season_avg'] = features.get('points_per_game', 0)
-            
-            # Team strength features
-            team_strength_cols = [
-                'strength_overall_home', 'strength_overall_away',
-                'strength_attack_home', 'strength_attack_away', 
-                'strength_defence_home', 'strength_defence_away'
-            ]
-            for col in team_strength_cols:
-                if col in features.columns:
-                    features[col] = features[col].fillna(3)
-            
-            # Availability and injury risk
-            if 'chance_of_playing_this_round' in features.columns:
-                features['availability'] = features['chance_of_playing_this_round'].fillna(100) / 100
-            else:
-                features['availability'] = 1.0
-            
-            # Select final features for modeling
-            model_features = [
-                'expected_minutes', 'start_probability', 'form', 'total_points',
-                'points_per_game', 'goals_scored', 'assists', 'clean_sheets',
-                'bonus', 'bps', 'ict_index', 'influence', 'creativity', 'threat',
-                'selected_by_percent', 'price_value', 'value_ratio', 'form_trend',
-                'season_avg', 'availability'
-            ]
-            
-            # Add position dummies
-            pos_cols = [col for col in features.columns if col.startswith('pos_')]
-            model_features.extend(pos_cols)
-            
-            # Add team strength features
-            available_strength_cols = [col for col in team_strength_cols if col in features.columns]
-            model_features.extend(available_strength_cols)
-            
-            # Keep only available features
-            available_features = [col for col in model_features if col in features.columns]
-            result = features[available_features].fillna(0)
-            
-            self.feature_names = available_features
-            return result
-            
-        except Exception as e:
-            self.logger.error(f"Error creating features for points prediction: {str(e)}")
-            return pd.DataFrame()
-    
-    def _prepare_training_data(self) -> Tuple[pd.DataFrame, pd.Series]:
-        """Prepare training data from current season data"""
-        try:
-            from backend.src.core.database import FPLDatabase
-            db = FPLDatabase()
-            
-            # Use current season data directly
-            players_df = db.get_players_with_stats()
-            
-            if players_df.empty:
-                self.logger.error("No player data available for training")
-                return pd.DataFrame(), pd.Series()
-            
-            # Use current season data as training data
-            merged_data = players_df.copy()
-            
-            # Use total_points as target (current season performance)
-            y = merged_data['total_points'].fillna(0)
-            
-            # Create features from current data
-            X = self._create_features(merged_data)
-            
-            if X.empty or len(y) == 0:
-                self.logger.warning("No valid training data for points model")
-                return pd.DataFrame(), pd.Series()
-            
-            self.logger.info(f"Prepared points training data from current season: {len(X)} samples, {len(X.columns)} features")
-            return X, y
-            
-        except Exception as e:
-            self.logger.error(f"Error preparing points training data: {str(e)}")
-            return pd.DataFrame(), pd.Series()
-    
+
+    def _feature_columns(self) -> List[str]:
+        if not self.feature_names:
+            self.feature_names = self.builder.get_feature_columns()
+        return self.feature_names
+
+    def _prepare_training_data(self) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
+        dataset = self.builder.build_points_training_set()
+        if dataset.empty:
+            return (
+                pd.DataFrame(),
+                pd.Series(dtype=float),
+                pd.Series(dtype=int),
+            )
+
+        feature_cols = self._feature_columns()
+        X = dataset[feature_cols].fillna(0)
+        y = dataset["points_target"]
+        rounds = dataset["round"]
+        return X, y, rounds
+
+    def _log_metrics(
+        self,
+        mae: float,
+        rmse: float,
+        r2: float,
+        splits,
+        artifact_path: Optional[str],
+    ) -> None:
+        train_start = splits.train_rounds[0] if splits.train_rounds else None
+        train_end = splits.train_rounds[-1] if splits.train_rounds else None
+        val_gw = splits.validation_rounds[-1] if splits.validation_rounds else None
+        test_gw = splits.test_rounds[-1] if splits.test_rounds else None
+
+        self.db.save_model_metrics(
+            model_name="points_model",
+            version=self.model_version or datetime.utcnow().strftime("%Y%m%d%H%M%S"),
+            train_start_gw=train_start or 0,
+            train_end_gw=train_end or 0,
+            validation_gw=val_gw,
+            test_gw=test_gw,
+            metrics={"mae": mae, "rmse": rmse, "r2": r2},
+            artifact_path=artifact_path,
+        )
+
     def train(self, retrain: bool = False) -> bool:
-        """Train the points prediction model"""
         try:
             if self.is_fitted and not retrain:
                 self.logger.info("Points model already trained. Use retrain=True to retrain.")
                 return True
-            
-            self.logger.info("Starting points model training...")
-            
-            # Train minutes model first if not trained
+
+            self.logger.info("Training points model with historical data...")
             if not self.minutes_model.is_trained():
-                self.logger.info("Training minutes model first...")
                 if not self.minutes_model.train():
-                    self.logger.error("Failed to train minutes model")
+                    self.logger.error("Minutes model training failed; cannot train points model")
                     return False
-            
-            # Prepare training data
-            X, y = self._prepare_training_data()
-            
-            if X.empty:
-                self.logger.error("No training data available for points model")
+
+            data_tuple = self._prepare_training_data()
+            if data_tuple[0].empty:
+                self.logger.error("No historical data available for points model")
                 return False
-            
-            # Split data
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=0.2, random_state=42
-            )
-            
-            # Scale features
-            X_train_scaled = self.feature_scaler.fit_transform(X_train)
-            X_test_scaled = self.feature_scaler.transform(X_test)
-            
-            # Train regressor
+
+            X, y, rounds = data_tuple
+            feature_cols = self._feature_columns()
+
+            dataset = pd.DataFrame(X, columns=feature_cols).copy()
+            dataset["points_target"] = y.values
+            dataset["round"] = rounds.values
+
+            splits = self.builder.split_by_gameweek(dataset)
+            if not splits.train_rounds or not splits.test_rounds:
+                self.logger.error("Insufficient rounds for chronological splits in points model")
+                return False
+
+            train_mask = dataset["round"].isin(splits.train_rounds)
+            test_mask = dataset["round"].isin(splits.test_rounds)
+
+            X_train = dataset.loc[train_mask, feature_cols]
+            y_train = dataset.loc[train_mask, "points_target"]
+
+            if X_train.empty:
+                self.logger.error("Training set is empty for points model")
+                return False
+
+            self.feature_scaler.fit(X_train)
+            X_train_scaled = self.feature_scaler.transform(X_train)
             self.regressor = GradientBoostingRegressor(
-                n_estimators=200,
-                learning_rate=0.1,
-                max_depth=6,
+                n_estimators=400,
+                learning_rate=0.05,
+                max_depth=5,
                 subsample=0.8,
-                random_state=42
+                random_state=42,
             )
-            
             self.regressor.fit(X_train_scaled, y_train)
-            
-            # Evaluate
-            y_pred = self.regressor.predict(X_test_scaled)
-            mae = mean_absolute_error(y_test, y_pred)
-            rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-            
-            self.logger.info(f"Points model performance - MAE: {mae:.2f}, RMSE: {rmse:.2f}")
-            
+
+            X_test = dataset.loc[test_mask, feature_cols]
+            y_test = dataset.loc[test_mask, "points_target"]
+            if X_test.empty:
+                X_test = X_train
+                y_test = y_train
+
+            X_test_scaled = self.feature_scaler.transform(X_test)
+            predictions = self.regressor.predict(X_test_scaled)
+            mae = mean_absolute_error(y_test, predictions)
+            rmse = np.sqrt(mean_squared_error(y_test, predictions))
+            r2 = r2_score(y_test, predictions)
+            self.logger.info(
+                "Points model evaluation — MAE: %.2f, RMSE: %.2f, R2: %.3f", mae, rmse, r2
+            )
+
             self.is_fitted = True
+            artifact_path = str(self.settings.ML_MODELS_DIR / "points_model.pkl")
+            self.model_version = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+            self.save_model(artifact_path)
+            self._log_metrics(mae, rmse, r2, splits, artifact_path)
             return True
-            
+
         except Exception as e:
             self.logger.error(f"Error training points model: {str(e)}")
             return False
-    
+
+    def _build_feature_frame(self, players_df: pd.DataFrame) -> pd.DataFrame:
+        feature_frame = self.builder.build_prediction_features(players_df["id"].tolist())
+        if feature_frame.empty:
+            return pd.DataFrame()
+
+        feature_cols = self._feature_columns()
+        result = feature_frame[["player_id", *feature_cols]].copy()
+        return result
+
     def predict_points(self, players_df: pd.DataFrame) -> pd.DataFrame:
-        """Predict points for players"""
         try:
             if not self.is_fitted:
-                self.logger.warning("Points model not trained. Training now...")
                 if not self.train():
-                    self.logger.error("Failed to train points model")
                     return pd.DataFrame()
-            
-            # Get minutes predictions first
+
             minutes_pred = self.minutes_model.predict_minutes(players_df)
-            
             if minutes_pred.empty:
-                self.logger.error("Failed to get minutes predictions")
+                self.logger.error("Minutes predictions unavailable; aborting points prediction")
                 return pd.DataFrame()
-            
-            # Create features
-            X = self._create_features(players_df, minutes_pred)
-            
-            if X.empty:
-                self.logger.error("No features created for points prediction")
+
+            feature_frame = self._build_feature_frame(players_df)
+            if feature_frame.empty:
+                self.logger.error("Unable to build feature frame for points prediction")
                 return pd.DataFrame()
-            
-            # Scale and predict
+
+            feature_cols = self._feature_columns()
+            X = feature_frame[feature_cols].fillna(0)
             X_scaled = self.feature_scaler.transform(X)
             predicted_points = self.regressor.predict(X_scaled)
-            
-            # Clip to reasonable range (0-25 points)
             predicted_points = np.clip(predicted_points, 0, 25)
-            
-            # Combine with player info and minutes predictions
+
             results = players_df[['id', 'web_name', 'position', 'team_name', 'now_cost']].copy()
             results = results.merge(
                 minutes_pred[['player_id', 'expected_minutes', 'start_probability']],
-                left_on='id', right_on='player_id', how='left'
+                left_on='id',
+                right_on='player_id',
+                how='left'
+            ).merge(
+                feature_frame,
+                left_on='id',
+                right_on='player_id',
+                how='left'
             )
-            
+
             results['predicted_points'] = predicted_points
-            results['points_per_million'] = results['predicted_points'] / (results['now_cost'] / 10.0)
-            
-            # Add confidence intervals (simple approach)
-            results['points_lower'] = np.maximum(0, predicted_points - 2.0)
-            results['points_upper'] = predicted_points + 2.0
-            
-            # Risk categories
+            results['points_per_million'] = results['predicted_points'] / (results['now_cost'] / 10.0).replace(0, np.nan)
+            results['points_lower'] = np.maximum(0, predicted_points - 2.5)
+            results['points_upper'] = predicted_points + 2.5
             results['risk_category'] = pd.cut(
                 results['start_probability'],
                 bins=[0, 0.3, 0.7, 1.0],
                 labels=['High Risk', 'Medium Risk', 'Low Risk'],
                 include_lowest=True
             )
-            
+
             return results.sort_values('predicted_points', ascending=False)
-            
+
         except Exception as e:
             self.logger.error(f"Error predicting points: {str(e)}")
             return pd.DataFrame()

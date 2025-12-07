@@ -4,8 +4,10 @@ import sqlite3
 import time
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import json
+
+from backend.src.integrations.odds_api import OddsAPIClient, normalize_team_name
 
 class FPLDataCollector:
     """Handles data collection from the FPL API"""
@@ -82,8 +84,8 @@ class FPLDataCollector:
                 return False
             
             # Connect to database
-            from backend.src.core.database import FPLDatabase
-            db = FPLDatabase()
+            from backend.src.core.db_factory import get_db
+            db = get_db()
             
             # Update teams
             teams_df = pd.DataFrame(bootstrap['teams'])
@@ -122,8 +124,8 @@ class FPLDataCollector:
                 self.logger.error("Failed to fetch fixtures data")
                 return False
             
-            from backend.src.core.database import FPLDatabase
-            db = FPLDatabase()
+            from backend.src.core.db_factory import get_db
+            db = get_db()
             
             fixtures_df = pd.DataFrame(fixtures)
             db.update_fixtures(fixtures_df)
@@ -133,6 +135,149 @@ class FPLDataCollector:
             
         except Exception as e:
             self.logger.error(f"Error updating fixtures data: {str(e)}")
+            return False
+    
+    def _build_team_lookup(self, teams_df: pd.DataFrame) -> Dict[str, int]:
+        lookup = {}
+        if teams_df.empty:
+            return lookup
+        for _, row in teams_df.iterrows():
+            variants = {
+                row.get('name', ''),
+                row.get('short_name', ''),
+                row.get('name', '').replace("FC", "").strip(),
+            }
+            for name in variants:
+                key = normalize_team_name(name)
+                if key:
+                    lookup[key] = row['id']
+        # Manual aliases
+        aliases = {
+            "man united": "man united",
+            "man utd": "man united",
+            "man city": "man city",
+            "tottenham": "tottenham",
+            "wolves": "wolves",
+            "brighton": "brighton",
+        }
+        for alias, target in aliases.items():
+            if target in lookup:
+                lookup[alias] = lookup[target]
+        return lookup
+    
+    def _match_fixture_row(self, fixtures_df: pd.DataFrame, home_team_id: int, away_team_id: int, commence_time: Optional[str]) -> Optional[pd.Series]:
+        if fixtures_df.empty:
+            return None
+        candidates = fixtures_df[
+            (fixtures_df['team_h'] == home_team_id) &
+            (fixtures_df['team_a'] == away_team_id)
+        ]
+        if candidates.empty:
+            return None
+        unfinished = candidates[candidates.get('finished', 1) == 0]
+        if not unfinished.empty:
+            candidates = unfinished
+        if commence_time:
+            try:
+                target_time = pd.to_datetime(commence_time, utc=True)
+                candidates = candidates.copy()
+                candidates['kickoff_dt'] = pd.to_datetime(candidates['kickoff_time'], utc=True, errors='coerce')
+                candidates['time_diff'] = (candidates['kickoff_dt'] - target_time).abs()
+                candidates = candidates.sort_values('time_diff')
+            except Exception:
+                candidates = candidates.sort_values('kickoff_time')
+        else:
+            candidates = candidates.sort_values('kickoff_time')
+        return candidates.iloc[0]
+    
+    def _extract_implied_goals(self, odds_event: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
+        bookmakers = odds_event.get('bookmakers') or []
+        for bookmaker in bookmakers:
+            markets = bookmaker.get('markets') or []
+            team_totals = next((m for m in markets if m.get('key') == 'team_totals'), None)
+            home_line = None
+            away_line = None
+            market_key = 'team_totals'
+            if team_totals:
+                for outcome in team_totals.get('outcomes', []):
+                    outcome_name = normalize_team_name(outcome.get('name') or outcome.get('team'))
+                    description = (outcome.get('description') or "").lower()
+                    point = outcome.get('point')
+                    if outcome_name == normalize_team_name(odds_event.get('home_team')) and description == 'over':
+                        home_line = point
+                    if outcome_name == normalize_team_name(odds_event.get('away_team')) and description == 'over':
+                        away_line = point
+            if home_line is not None and away_line is not None:
+                return home_line, away_line, bookmaker.get('title') or bookmaker.get('key'), market_key
+            totals_market = next((m for m in markets if m.get('key') == 'totals'), None)
+            if totals_market:
+                outcomes = totals_market.get('outcomes') or []
+                if outcomes:
+                    point = outcomes[0].get('point')
+                    if point:
+                        market_key = 'totals'
+                        return point / 2, point / 2, bookmaker.get('title') or bookmaker.get('key'), market_key
+        return None, None, None, None
+    
+    def update_fixture_odds(self) -> bool:
+        """Fetch bookmaker odds and store implied goals."""
+        try:
+            self.logger.info("Updating fixture odds from TheOddsAPI...")
+            client = OddsAPIClient()
+            odds_events = client.fetch_fixture_odds()
+            if not odds_events:
+                self.logger.warning("No odds data retrieved.")
+                return False
+            
+            from backend.src.core.db_factory import get_db
+            db = get_db()
+            fixtures_df = db.get_fixtures()
+            teams_df = db.get_teams()
+            if fixtures_df.empty or teams_df.empty:
+                self.logger.warning("Fixtures or teams data unavailable; cannot map odds.")
+                return False
+            
+            team_lookup = self._build_team_lookup(teams_df)
+            odds_records = []
+            
+            for event in odds_events:
+                home_name_raw = event.get('home_team')
+                away_name_raw = event.get('away_team')
+                home_id = team_lookup.get(normalize_team_name(home_name_raw))
+                away_id = team_lookup.get(normalize_team_name(away_name_raw))
+                if not home_id or not away_id:
+                    continue
+                
+                fixture_row = self._match_fixture_row(fixtures_df, home_id, away_id, event.get('commence_time'))
+                if fixture_row is None:
+                    continue
+                
+                home_goals, away_goals, bookmaker, market = self._extract_implied_goals(event)
+                if home_goals is None or away_goals is None:
+                    continue
+                
+                odds_records.append({
+                    'fixture_id': int(fixture_row['id']),
+                    'event': int(fixture_row.get('event') or 0),
+                    'home_team': home_id,
+                    'away_team': away_id,
+                    'bookmaker': bookmaker,
+                    'market': market,
+                    'home_implied_goals': float(home_goals),
+                    'away_implied_goals': float(away_goals),
+                    'raw_odds': json.dumps(event),
+                })
+            
+            if not odds_records:
+                self.logger.warning("No odds records matched to fixtures.")
+                return False
+            
+            success = db.upsert_fixture_odds(odds_records)
+            if success:
+                self.logger.info(f"Updated odds for {len(odds_records)} fixtures.")
+            return success
+        except Exception as e:
+            self.logger.error(f"Error updating fixture odds: {str(e)}")
             return False
     
     def update_gameweek_live_data(self, gameweek: int) -> bool:
@@ -145,8 +290,8 @@ class FPLDataCollector:
                 self.logger.error(f"Failed to fetch live data for GW {gameweek}")
                 return False
             
-            from backend.src.core.database import FPLDatabase
-            db = FPLDatabase()
+            from backend.src.core.db_factory import get_db
+            db = get_db()
             
             # Process player stats
             player_stats = []
@@ -170,12 +315,12 @@ class FPLDataCollector:
     def update_player_histories(self, player_ids: List[int] = None, limit: int = 50) -> bool:
         """Update detailed history for players (rate limited)"""
         try:
-            from backend.src.core.database import FPLDatabase
-            db = FPLDatabase()
+            from backend.src.core.db_factory import get_db
+            db = get_db()
             
             if player_ids is None:
-                # Get all active players
-                player_ids = db.get_active_player_ids()
+                # Get all players that should have trackable history (includes injured/suspended)
+                player_ids = db.get_trackable_player_ids()
             
             # Limit to prevent excessive API calls
             if limit and len(player_ids) > limit:
@@ -212,7 +357,7 @@ class FPLDataCollector:
             self.logger.error(f"Error updating player histories: {str(e)}")
             return False
     
-    def update_all_data(self, include_history: bool = False) -> bool:
+    def update_all_data(self, include_history: bool = True) -> bool:
         """Update all FPL data"""
         try:
             self.logger.info("Starting full data update...")
@@ -227,9 +372,13 @@ class FPLDataCollector:
             if self.update_fixtures_data():
                 success_count += 1
             
+            # Update bookmaker odds
+            if self.update_fixture_odds():
+                success_count += 1
+            
             # Update current gameweek live data
-            from backend.src.core.database import FPLDatabase
-            db = FPLDatabase()
+            from backend.src.core.db_factory import get_db
+            db = get_db()
             current_gw = db.get_current_gameweek()
             
             if current_gw and current_gw > 1:

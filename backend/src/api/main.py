@@ -13,7 +13,10 @@ from backend.src.core.database import FPLDatabase
 from backend.src.core.data_collector import FPLDataCollector
 
 # Import route modules
-from backend.src.api.routes import players, teams, analysis, managers, system
+from backend.src.api.routes import players, teams, analysis, managers, system, advanced, features
+
+# Import middleware
+from backend.src.middleware import setup_rate_limiting, setup_monitoring
 
 # Get settings
 settings = get_settings()
@@ -38,7 +41,8 @@ async def lifespan(app: FastAPI):
     
     # Check if we have data
     try:
-        db = FPLDatabase()
+        from backend.src.core.db_factory import get_db
+        db = get_db()  # Use factory pattern to get correct database
         data_collector = FPLDataCollector()
         
         players_df = db.get_players_with_stats()
@@ -80,18 +84,68 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Setup monitoring and rate limiting
+setup_monitoring(app, slow_threshold=1.0)
+setup_rate_limiting(app)
+
 # Register routers
 app.include_router(players.router)
 app.include_router(teams.router)
 app.include_router(analysis.router)
 app.include_router(managers.router)
 app.include_router(system.router)
+app.include_router(advanced.router)  # New advanced features
+app.include_router(features.router)  # xG, injury, chips, set pieces
 
 # Add health check at root
 @app.get("/health")
 async def root_health_check():
     """Root health check endpoint"""
     return {"status": "healthy", "message": "FPL AI Optimizer API is running", "version": settings.APP_VERSION}
+
+
+@app.get("/health/detailed")
+async def detailed_health_check():
+    """Detailed health check with service status"""
+    from backend.src.core.cache import get_cache
+    from backend.src.core.db_factory import get_db, get_db_factory
+    
+    cache = get_cache()
+    db = get_db()
+    factory = get_db_factory()
+    
+    health_status = {
+        "status": "healthy",
+        "version": settings.APP_VERSION,
+        "services": {
+            "database": {
+                "status": "healthy" if db.test_connection() else "unhealthy",
+                "type": "PostgreSQL" if factory.is_postgres() else "SQLite"
+            },
+            "redis": {
+                "status": "healthy" if cache.client is not None else "unhealthy",
+                "connected": cache.client is not None
+            },
+            "api": {
+                "status": "healthy"
+            }
+        },
+        "features": {
+            "caching": cache.client is not None,
+            "background_tasks": True,
+            "rate_limiting": True,
+            "monitoring": True
+        }
+    }
+    
+    # Overall status
+    all_healthy = all(
+        service["status"] == "healthy" 
+        for service in health_status["services"].values()
+    )
+    health_status["status"] = "healthy" if all_healthy else "degraded"
+    
+    return health_status
 
 
 @app.get("/")

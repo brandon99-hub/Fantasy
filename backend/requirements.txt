@@ -1,8 +1,10 @@
 # FPL Optimizer - Complete Requirements
+
 # Core Data Science
 pandas>=1.5.0
 numpy>=1.21.0
 scikit-learn>=1.1.0
+scipy>=1.9.0  # For statistical analysis
 
 # Machine Learning
 xgboost>=1.6.0
@@ -17,13 +19,34 @@ uvicorn>=0.18.0
 pydantic>=1.9.0
 
 # Database
-sqlite3  # Built-in with Python
+asyncpg>=0.29.0  # Async PostgreSQL driver
+psycopg[binary]>=3.1.0  # Sync PostgreSQL driver (for CLI/crawler)
+
+# Caching & Background Tasks
+redis>=5.0.0
+celery>=5.3.0
+celery[redis]>=5.3.0
+flower>=2.0.0  # Celery monitoring UI
+kombu>=5.3.0  # Celery messaging
 
 # HTTP Requests
 requests>=2.28.0
+httpx>=0.24.0  # Async HTTP client for Phase 2
+
+# Phase 2: Web Scraping & Data Processing
+beautifulsoup4>=4.12.0  # FBRef scraping
+lxml>=4.9.0  # HTML parsing
+fuzzywuzzy>=0.18.0  # Player name matching
+python-Levenshtein>=0.21.0  # Fuzzy matching speedup
 
 # Data Processing
 python-dateutil>=2.8.0
+
+# Rate Limiting & Monitoring
+slowapi>=0.1.9
+sentry-sdk[fastapi]>=1.40.0  # Error tracking
+prometheus-client>=0.17.0  # Metrics
+structlog>=23.1.0  # Structured logging
 
 # Optional: Advanced ML (uncomment if needed)
 # tensorflow>=2.10.0
@@ -39,3 +62,4 @@ loguru>=0.6.0
 
 # Type hints
 typing-extensions>=4.0.0
+

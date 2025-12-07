@@ -1,45 +1,139 @@
 version: '3.8'
 
 services:
-  backend:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: fpl_postgres
+    environment:
+      POSTGRES_DB: myfpl
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-your_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fpl_network
+
+  # Redis Cache & Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: fpl_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - fpl_network
+
+  # FastAPI Application
+  api:
     build:
       context: .
-      dockerfile: docker/backend.Dockerfile
+      dockerfile: Dockerfile
+    container_name: fpl_api
+    command: uvicorn backend.src.api.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
       - "8000:8000"
+    environment:
+      - USE_POSTGRES=true
+      - POSTGRES_CONNECTION_STRING=postgresql://postgres:${POSTGRES_PASSWORD:-your_password}@postgres:5432/myfpl
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
     volumes:
+      - .:/app
       - ./backend/data:/app/backend/data
       - ./backend/logs:/app/backend/logs
-    environment:
-      - DATABASE_PATH=/app/backend/data/fpl_data.db
-      - API_HOST=0.0.0.0
-      - API_PORT=8000
-      - CORS_ORIGINS=http://localhost:3000,http://frontend:3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
-      - fpl-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      - fpl_network
 
-  frontend:
+  # Celery Worker
+  celery_worker:
     build:
       context: .
-      dockerfile: docker/frontend.Dockerfile
-    ports:
-      - "3000:3000"
+      dockerfile: Dockerfile
+    container_name: fpl_celery_worker
+    command: celery -A backend.src.tasks.celery_app worker --loglevel=info -Q high_priority,medium_priority,low_priority,default --concurrency=4
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - USE_POSTGRES=true
+      - POSTGRES_CONNECTION_STRING=postgresql://postgres:${POSTGRES_PASSWORD:-your_password}@postgres:5432/myfpl
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    volumes:
+      - .:/app
+      - ./backend/data:/app/backend/data
+      - ./backend/logs:/app/backend/logs
     depends_on:
-      - backend
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
-      - fpl-network
+      - fpl_network
 
-networks:
-  fpl-network:
-    driver: bridge
+  # Celery Beat (Scheduler)
+  celery_beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fpl_celery_beat
+    command: celery -A backend.src.tasks.celery_app beat --loglevel=info
+    environment:
+      - USE_POSTGRES=true
+      - POSTGRES_CONNECTION_STRING=postgresql://postgres:${POSTGRES_PASSWORD:-your_password}@postgres:5432/myfpl
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    volumes:
+      - .:/app
+      - ./backend/data:/app/backend/data
+      - ./backend/logs:/app/backend/logs
+    depends_on:
+      - redis
+    networks:
+      - fpl_network
+
+  # Flower (Celery Monitoring)
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fpl_flower
+    command: celery -A backend.src.tasks.celery_app flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - redis
+      - celery_worker
+    networks:
+      - fpl_network
 
 volumes:
-  fpl-data:
+  postgres_data:
+  redis_data:
 
+networks:
+  fpl_network:
+    driver: bridge

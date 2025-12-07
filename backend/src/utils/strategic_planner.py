@@ -543,9 +543,18 @@ class StrategicPlanner:
                 captain_options = home_team_players.nlargest(5, 'form')
                 
                 if not captain_options.empty:
+                    records = captain_options[['id', 'web_name', 'position', 'form', 'selected_by_percent']].to_dict('records')
+                    # If effective ownership columns are present, include them for richer UI
+                    if 'effective_ownership' in captain_options.columns:
+                        for rec in records:
+                            row = captain_options[captain_options['id'] == rec['id']].iloc[0]
+                            rec['effective_ownership'] = float(row.get('effective_ownership', rec['selected_by_percent']))
+                            top_captain_share = row.get('top_cohort_captain_pct')
+                            if pd.notna(top_captain_share):
+                                rec['top10k_captain_pct'] = float(top_captain_share)
                     captain_strategy['next_5_captains'].append({
                         'gameweek': gw,
-                        'top_options': captain_options[['id', 'web_name', 'position', 'form', 'selected_by_percent']].to_dict('records')
+                        'top_options': records
                     })
                 
                 # Identify differential captains

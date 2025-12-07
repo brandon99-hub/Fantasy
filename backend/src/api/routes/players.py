@@ -1,31 +1,21 @@
 """Player-related API endpoints"""
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from typing import List, Optional
+import pandas as pd
 
-from backend.src.core.database import FPLDatabase
+from backend.src.core.async_db import AsyncDatabaseWrapper, get_async_db
 from backend.src.utils.serialization import convert_numpy_types
 from backend.src.schemas.models import PlayerResponse
+from backend.src.core.cache import cache_result
 
 router = APIRouter(prefix="/api/players", tags=["players"])
-db = FPLDatabase()
-
-# Server-side cache
-players_cache = None
-
-def get_cached_players():
-    global players_cache
-    if players_cache is None:
-        players_cache = db.get_players_with_stats()
-    return players_cache
-
-def clear_cache():
-    global players_cache
-    players_cache = None
 
 
 @router.get("", response_model=List[PlayerResponse])
+@cache_result(key_prefix="players")
 async def get_players(
+    db: AsyncDatabaseWrapper = Depends(get_async_db),
     position: Optional[str] = Query(None, description="Filter by position (GKP, DEF, MID, FWD)"),
     team: Optional[str] = Query(None, description="Filter by team name"),
     search: Optional[str] = Query(None, description="Search player names"),
@@ -36,7 +26,8 @@ async def get_players(
 ):
     """Get players with optional filtering"""
     try:
-        players_df = get_cached_players()
+        # Async database call
+        players_df = await db.get_players_with_stats()
         
         if players_df.empty:
             raise HTTPException(status_code=404, detail="No players found")
@@ -81,13 +72,16 @@ async def get_players(
 
 
 @router.get("/search", response_model=List[PlayerResponse])
+@cache_result(key_prefix="players_search")
 async def search_players(
+    db: AsyncDatabaseWrapper = Depends(get_async_db),
     search: str = Query(..., description="Search term for player names"),
     position: Optional[str] = Query(None, description="Filter by position")
 ):
     """Search players by name"""
     try:
-        players_df = get_cached_players()
+        # Async database call
+        players_df = await db.get_players_with_stats()
         
         if players_df.empty:
             raise HTTPException(status_code=404, detail="No players found")
@@ -126,4 +120,3 @@ async def search_players(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error searching players: {str(e)}")
-

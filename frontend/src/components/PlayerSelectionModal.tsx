@@ -1,10 +1,11 @@
 'use client';
 
-import { useState, useEffect, Fragment } from 'react';
+import { useState, useEffect, Fragment, useCallback, useRef } from 'react';
 import { Dialog, Transition, Listbox } from '@headlessui/react';
 import { XMarkIcon, ChevronUpDownIcon, CheckIcon, MagnifyingGlassIcon } from '@heroicons/react/24/outline';
-import { Player } from '@/lib/types';
+import { Player, Club } from '@/lib/types';
 import { formatPrice, getPositionIcon, getPlayerStatus, classNames } from '@/lib/utils';
+import { FPLApi } from '@/lib/api';
 
 interface PlayerSelectionModalProps {
   isOpen: boolean;
@@ -16,15 +17,7 @@ interface PlayerSelectionModalProps {
   selectedPlayers?: Player[];
 }
 
-interface Team {
-  id: number;
-  name: string;
-  short_name: string;
-}
-
-// Simple cache for player data
-const playerCache: { [position: string]: Player[] } = {};
-const teamsCache: Team[] = [];
+const CACHE_TTL_MS = 5 * 60 * 1000;
 
 export default function PlayerSelectionModal({ 
   isOpen, 
@@ -37,21 +30,75 @@ export default function PlayerSelectionModal({
 }: PlayerSelectionModalProps) {
   const [players, setPlayers] = useState<Player[]>([]);
   const [filteredPlayers, setFilteredPlayers] = useState<Player[]>([]);
-  const [teams, setTeams] = useState<Team[]>([]);
+  const [teams, setTeams] = useState<Club[]>([]);
   const [loading, setLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedTeam, setSelectedTeam] = useState<Team | null>(null);
+  const [selectedTeam, setSelectedTeam] = useState<Club | null>(null);
   const [sortBy, setSortBy] = useState<'points' | 'price' | 'form' | 'name'>('points');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
   const [multiSelectMode, setMultiSelectMode] = useState(batchMode);
   const [tempSelectedPlayers, setTempSelectedPlayers] = useState<Player[]>([]);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [minPrice, setMinPrice] = useState('');
+  const [maxPrice, setMaxPrice] = useState('');
+  const [onlyAvailable, setOnlyAvailable] = useState(false);
+
+  const playerCacheRef = useRef<Map<string, { data: Player[]; timestamp: number }>>(new Map());
+  const teamsCacheRef = useRef<{ data: Club[]; timestamp: number }>({ data: [], timestamp: 0 });
+
+  const fetchData = useCallback(async () => {
+    const positionMap = {
+      GKP: 'Goalkeeper',
+      DEF: 'Defender',
+      MID: 'Midfielder',
+      FWD: 'Forward'
+    };
+    
+    const dbPosition = positionMap[position as keyof typeof positionMap] || position;
+    setLoading(true);
+    setFetchError(null);
+    
+    try {
+      const now = Date.now();
+      const cachedPlayers = playerCacheRef.current.get(dbPosition);
+      const playerCacheFresh = cachedPlayers && now - cachedPlayers.timestamp < CACHE_TTL_MS;
+      const teamCacheFresh = teamsCacheRef.current.data.length > 0 && now - teamsCacheRef.current.timestamp < CACHE_TTL_MS;
+      
+      let playersData: Player[] = [];
+      if (playerCacheFresh && cachedPlayers) {
+        playersData = cachedPlayers.data;
+      } else {
+        playersData = await FPLApi.getPlayers({ position: dbPosition });
+        playerCacheRef.current.set(dbPosition, { data: playersData, timestamp: now });
+      }
+      
+      let teamsData: Club[] = [];
+      if (teamCacheFresh) {
+        teamsData = teamsCacheRef.current.data;
+      } else {
+        teamsData = await FPLApi.getTeams();
+        teamsCacheRef.current = { data: teamsData, timestamp: now };
+      }
+      
+      setPlayers(playersData || []);
+      setTeams(teamsData || []);
+    } catch (error) {
+      console.error('Failed to load player data', error);
+      setFetchError('Unable to load player data. Please verify the backend is running and try again.');
+      setPlayers([]);
+      setFilteredPlayers([]);
+      setTeams([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [position]);
 
   // Fetch players and teams when modal opens
   useEffect(() => {
     if (isOpen) {
       fetchData();
     }
-  }, [isOpen, position]);
+  }, [isOpen, position, fetchData]);
 
   // Reset state when modal closes
   useEffect(() => {
@@ -61,6 +108,7 @@ export default function PlayerSelectionModal({
       setTeams([]);
       setSearchQuery('');
       setSelectedTeam(null);
+      setFetchError(null);
     }
   }, [isOpen]);
 
@@ -79,6 +127,24 @@ export default function PlayerSelectionModal({
     // Filter by team
     if (selectedTeam) {
       filtered = filtered.filter(player => player.team === selectedTeam.id);
+    }
+
+    if (minPrice) {
+      const min = parseFloat(minPrice);
+      if (!Number.isNaN(min)) {
+        filtered = filtered.filter(player => player.now_cost / 10 >= min);
+      }
+    }
+
+    if (maxPrice) {
+      const max = parseFloat(maxPrice);
+      if (!Number.isNaN(max)) {
+        filtered = filtered.filter(player => player.now_cost / 10 <= max);
+      }
+    }
+
+    if (onlyAvailable) {
+      filtered = filtered.filter(player => player.status === 'a');
     }
 
     // Sort players
@@ -115,66 +181,7 @@ export default function PlayerSelectionModal({
     });
 
     setFilteredPlayers(filtered);
-  }, [players, searchQuery, selectedTeam, sortBy, sortOrder]);
-
-  const fetchData = async () => {
-    // Map frontend position codes to database position names
-    const positionMap = {
-      'GKP': 'Goalkeeper',
-      'DEF': 'Defender', 
-      'MID': 'Midfielder',
-      'FWD': 'Forward'
-    };
-    
-    const dbPosition = positionMap[position as keyof typeof positionMap] || position;
-    
-    // Check cache first
-    if (playerCache[dbPosition] && teamsCache.length > 0) {
-      setPlayers(playerCache[dbPosition]);
-      setTeams(teamsCache);
-      return;
-    }
-    
-    setLoading(true);
-    try {
-      const promises = [];
-      
-      // Fetch players only if not cached
-      if (!playerCache[dbPosition]) {
-        promises.push(fetch(`http://localhost:8000/api/players?position=${dbPosition}`));
-      } else {
-        promises.push(Promise.resolve({ ok: true, json: () => Promise.resolve(playerCache[dbPosition]) }));
-      }
-      
-      // Fetch teams only if not cached
-      if (teamsCache.length === 0) {
-        promises.push(fetch('http://localhost:8000/api/teams'));
-      } else {
-        promises.push(Promise.resolve({ ok: true, json: () => Promise.resolve(teamsCache) }));
-      }
-      
-      const [playersResponse, teamsResponse] = await Promise.all(promises);
-      
-      if (playersResponse.ok) {
-        const playersData = await playersResponse.json();
-        playerCache[dbPosition] = playersData || [];
-        setPlayers(playersData || []);
-      }
-
-      if (teamsResponse.ok) {
-        const teamsData = await teamsResponse.json();
-        if (teamsCache.length === 0) {
-          teamsCache.push(...(teamsData || []));
-        }
-        setTeams(teamsData || []);
-      }
-    } catch (error) {
-      setPlayers([]);
-      setTeams([]);
-    } finally {
-      setLoading(false);
-    }
-  };
+  }, [players, searchQuery, selectedTeam, sortBy, sortOrder, minPrice, maxPrice, onlyAvailable]);
 
   const handlePlayerSelect = (player: Player) => {
     if (multiSelectMode) {
@@ -194,19 +201,15 @@ export default function PlayerSelectionModal({
 
   const handleConfirmBatch = () => {
     // Send all selected players one by one with a small delay to ensure state updates
-    if (tempSelectedPlayers.length > 0) {
-      tempSelectedPlayers.forEach((player, idx) => {
-        // Use setTimeout to ensure each player is processed separately
-        setTimeout(() => {
-          onPlayerSelect(player);
-        }, idx * 10);
-      });
-      setTempSelectedPlayers([]);
-      // Close after all players are sent
-      setTimeout(() => {
-        onClose();
-      }, tempSelectedPlayers.length * 10 + 100);
+    if (tempSelectedPlayers.length === 0) {
+      return;
     }
+
+    tempSelectedPlayers.forEach((player) => {
+      onPlayerSelect(player);
+    });
+    setTempSelectedPlayers([]);
+    onClose();
   };
 
   const handleCancelBatch = () => {
@@ -305,33 +308,30 @@ export default function PlayerSelectionModal({
                 </div>
 
                 {/* Filters */}
-                <div className="bg-gray-50 px-8 py-4 border-b">
+                <div className="border-b bg-slate-50 px-6 py-4">
                   <div className="flex flex-wrap items-center gap-4">
-                    
-                    {/* Search */}
-                    <div className="flex-1 min-w-64">
+                    <div className="min-w-60 flex-1">
                       <div className="relative">
-                        <MagnifyingGlassIcon className="absolute left-3 top-1/2 transform -translate-y-1/2 h-5 w-5 text-gray-400" />
+                        <MagnifyingGlassIcon className="pointer-events-none absolute left-3 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
                         <input
                           type="text"
                           placeholder="Search players..."
                           value={searchQuery}
                           onChange={(e) => setSearchQuery(e.target.value)}
-                          className="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-colors"
+                          className="w-full rounded-xl border border-slate-200 bg-white pl-10 pr-4 py-2.5 text-sm text-slate-900 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100"
                         />
                       </div>
                     </div>
 
-                    {/* Team Filter */}
                     <div className="min-w-48">
                       <Listbox value={selectedTeam} onChange={setSelectedTeam}>
                         <div className="relative">
-                          <Listbox.Button className="relative w-full cursor-pointer rounded-xl bg-white py-3 pl-4 pr-10 text-left border border-gray-300 focus:outline-none focus:ring-2 focus:ring-blue-500">
+                          <Listbox.Button className="relative w-full cursor-pointer rounded-xl border border-slate-200 bg-white py-2.5 pl-4 pr-10 text-left text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-100">
                             <span className="block truncate">
-                              {selectedTeam ? selectedTeam.name : 'All Teams'}
+                              {selectedTeam ? selectedTeam.name : 'All teams'}
                             </span>
                             <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-3">
-                              <ChevronUpDownIcon className="h-5 w-5 text-gray-400" />
+                              <ChevronUpDownIcon className="h-5 w-5 text-slate-400" />
                             </span>
                           </Listbox.Button>
                           <Transition
@@ -340,17 +340,17 @@ export default function PlayerSelectionModal({
                             leaveFrom="opacity-100"
                             leaveTo="opacity-0"
                           >
-                            <Listbox.Options className="absolute z-10 mt-1 max-h-60 w-full overflow-auto rounded-xl bg-white py-1 shadow-lg ring-1 ring-black ring-opacity-5 focus:outline-none">
+                            <Listbox.Options className="absolute z-20 mt-1 max-h-60 w-full overflow-auto rounded-xl border border-slate-100 bg-white py-1 text-sm shadow-xl focus:outline-none">
                               <Listbox.Option
                                 value={null}
                                 className={({ active }) =>
                                   classNames(
-                                    active ? 'bg-blue-50 text-blue-900' : 'text-gray-900',
-                                    'relative cursor-pointer select-none py-2 px-4'
+                                    active ? 'bg-blue-50 text-blue-900' : 'text-slate-900',
+                                    'cursor-pointer select-none px-4 py-2'
                                   )
                                 }
                               >
-                                All Teams
+                                All teams
                               </Listbox.Option>
                               {teams.map((team) => (
                                 <Listbox.Option
@@ -358,14 +358,14 @@ export default function PlayerSelectionModal({
                                   value={team}
                                   className={({ active }) =>
                                     classNames(
-                                      active ? 'bg-blue-50 text-blue-900' : 'text-gray-900',
-                                      'relative cursor-pointer select-none py-2 px-4'
+                                      active ? 'bg-blue-50 text-blue-900' : 'text-slate-900',
+                                      'cursor-pointer select-none px-4 py-2'
                                     )
                                   }
                                 >
                                   {({ selected }) => (
                                     <div className="flex items-center justify-between">
-                                      <span className={classNames(selected ? 'font-semibold' : 'font-normal')}>
+                                      <span className={selected ? 'font-semibold' : 'font-normal'}>
                                         {team.name}
                                       </span>
                                       {selected && <CheckIcon className="h-4 w-4 text-blue-600" />}
@@ -379,27 +379,26 @@ export default function PlayerSelectionModal({
                       </Listbox>
                     </div>
 
-                    {/* Sort */}
-                    <div className="flex items-center space-x-2">
+                    <div className="flex items-center gap-2">
                       <Listbox value={sortBy} onChange={setSortBy}>
                         <div className="relative">
-                          <Listbox.Button className="relative cursor-pointer rounded-xl bg-white py-3 pl-4 pr-10 text-left border border-gray-300 focus:outline-none focus:ring-2 focus:ring-blue-500 min-w-36">
+                          <Listbox.Button className="min-w-40 rounded-xl border border-slate-200 bg-white py-2.5 pl-4 pr-10 text-left text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-100">
                             <span className="block truncate">
                               Sort by {sortOptions.find(opt => opt.value === sortBy)?.label}
                             </span>
                             <span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-3">
-                              <ChevronUpDownIcon className="h-5 w-5 text-gray-400" />
+                              <ChevronUpDownIcon className="h-5 w-5 text-slate-400" />
                             </span>
                           </Listbox.Button>
-                          <Listbox.Options className="absolute z-10 mt-1 max-h-60 w-full overflow-auto rounded-xl bg-white py-1 shadow-lg ring-1 ring-black ring-opacity-5 focus:outline-none">
+                          <Listbox.Options className="absolute z-20 mt-1 max-h-60 w-full overflow-auto rounded-xl border border-slate-100 bg-white py-1 text-sm shadow-xl focus:outline-none">
                             {sortOptions.map((option) => (
                               <Listbox.Option
                                 key={option.value}
                                 value={option.value}
                                 className={({ active }) =>
                                   classNames(
-                                    active ? 'bg-blue-50 text-blue-900' : 'text-gray-900',
-                                    'relative cursor-pointer select-none py-2 px-4'
+                                    active ? 'bg-blue-50 text-blue-900' : 'text-slate-900',
+                                    'cursor-pointer select-none px-4 py-2'
                                   )
                                 }
                               >
@@ -409,173 +408,191 @@ export default function PlayerSelectionModal({
                           </Listbox.Options>
                         </div>
                       </Listbox>
-                      
+
                       <button
                         onClick={() => setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc')}
-                        className="px-4 py-3 bg-white border border-gray-300 rounded-xl hover:bg-gray-50 transition-colors"
+                        className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 transition-colors hover:bg-slate-100"
                       >
                         {sortOrder === 'desc' ? '↓' : '↑'}
                       </button>
                     </div>
                   </div>
+
+                  <div className="mt-4 flex flex-wrap items-center gap-3 text-xs text-slate-600">
+                    <div className="flex items-center gap-2">
+                      <span className="text-slate-500">Price (£m)</span>
+                      <input
+                        type="number"
+                        placeholder="Min"
+                        value={minPrice}
+                        onChange={(e) => setMinPrice(e.target.value)}
+                        className="w-20 rounded-lg border border-slate-200 px-2 py-1 text-xs focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-200"
+                      />
+                      <span className="text-slate-400">-</span>
+                      <input
+                        type="number"
+                        placeholder="Max"
+                        value={maxPrice}
+                        onChange={(e) => setMaxPrice(e.target.value)}
+                        className="w-20 rounded-lg border border-slate-200 px-2 py-1 text-xs focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-200"
+                      />
+                    </div>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={onlyAvailable}
+                        onChange={(e) => setOnlyAvailable(e.target.checked)}
+                        className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                      />
+                      <span>Available only</span>
+                    </label>
+                  </div>
                 </div>
 
                 {/* Players Table */}
-                <div className="max-h-96 overflow-y-auto">
+                <div className="max-h-[32rem] overflow-y-auto px-2">
+                  {fetchError && (
+                    <div className="rounded-2xl border border-red-200 bg-red-50/80 px-4 py-3 text-sm text-red-700">
+                      {fetchError}
+                    </div>
+                  )}
                   {loading ? (
-                    <div className="flex items-center justify-center py-12">
-                      <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
-                      <span className="ml-3 text-gray-600">Loading players...</span>
+                    <div className="flex flex-col items-center gap-2 py-10 text-slate-500">
+                      <div className="loading-spinner h-8 w-8 rounded-full border border-blue-200 border-t-blue-600"></div>
+                      Loading players...
                     </div>
                   ) : filteredPlayers.length === 0 ? (
-                    <div className="text-center py-12">
-                      <div className="text-gray-500 text-lg">No players found</div>
-                      <p className="text-gray-400 text-sm mt-2">Try adjusting your filters</p>
+                    <div className="py-12 text-center text-sm text-slate-500">
+                      No players match your filters. Try adjusting the search or removing constraints.
                     </div>
                   ) : (
-                    <div className="overflow-hidden">
-                      {/* Table Header */}
-                      <div className="bg-gray-50 border-b border-gray-200 px-6 py-3">
-                        <div className="grid grid-cols-12 gap-4 text-xs font-medium text-gray-500 uppercase tracking-wider">
-                          <div className="col-span-1"></div> {/* Photo */}
-                          <div className="col-span-3">Player</div>
-                          <div className="col-span-2">Team</div>
-                          <div className="col-span-1 text-center">Price</div>
-                          <div className="col-span-1 text-center">Points</div>
-                          <div className="col-span-1 text-center">Form</div>
-                          <div className="col-span-2 text-center">Selected</div>
-                          <div className="col-span-1 text-center">Status</div>
-                        </div>
+                    <>
+                      <div className="hidden md:block">
+                        <table className="min-w-full overflow-hidden rounded-2xl border border-slate-200 bg-white text-sm">
+                          <thead className="bg-slate-50 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                            <tr>
+                              {multiSelectMode && <th className="px-3 py-3 text-left">Select</th>}
+                              <th className="px-3 py-3 text-left">Player</th>
+                              <th className="px-3 py-3 text-left">Position</th>
+                              <th className="px-3 py-3 text-left">Team</th>
+                              <th className="px-3 py-3 text-right">Price</th>
+                              <th className="px-3 py-3 text-right">Total pts</th>
+                              <th className="px-3 py-3 text-right">Form</th>
+                              <th className="px-3 py-3 text-right">Ownership</th>
+                              <th className="px-3 py-3 text-center">Status</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100">
+                            {filteredPlayers.map((player) => {
+                              const playerStatus = getPlayerStatus(player);
+                              const isCurrentPlayer = currentPlayer?.id === player.id;
+                              const isTempSelected = multiSelectMode && tempSelectedPlayers.some(p => p.id === player.id);
+                              const isAlreadyInTeam = selectedPlayers.some(p => p.id === player.id);
+                              const isDisabled = isAlreadyInTeam && !isCurrentPlayer && !isTempSelected;
+
+                              return (
+                                <tr
+                                  key={player.id}
+                                  onClick={() => {
+                                    if (isDisabled) return;
+                                    handlePlayerSelect(player);
+                                  }}
+                                  className={classNames(
+                                    'cursor-pointer transition-colors',
+                                    isDisabled ? 'pointer-events-none opacity-60' : 'hover:bg-blue-50/40',
+                                    isTempSelected ? 'bg-green-50' : '',
+                                    isCurrentPlayer ? 'bg-blue-50' : ''
+                                  )}
+                                >
+                                  {multiSelectMode && (
+                                    <td className="px-3 py-3">
+                                      <input
+                                        type="checkbox"
+                                        checked={isTempSelected}
+                                        onChange={() => {}}
+                                        disabled={isDisabled}
+                                        className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                                      />
+                                    </td>
+                                  )}
+                                  <td className="px-3 py-3">
+                                    <div className="font-semibold text-slate-900">{player.web_name}</div>
+                                    <div className="text-xs text-slate-500">{player.first_name} {player.second_name}</div>
+                                  </td>
+                                  <td className="px-3 py-3 text-slate-500">{player.position}</td>
+                                  <td className="px-3 py-3 text-slate-500">{player.team_name}</td>
+                                  <td className="px-3 py-3 text-right font-semibold text-slate-900">{formatPrice(player.now_cost)}</td>
+                                  <td className="px-3 py-3 text-right font-semibold text-slate-900">{player.total_points}</td>
+                                  <td className="px-3 py-3 text-right text-blue-600">{player.form}</td>
+                                  <td className="px-3 py-3 text-right text-slate-600">{player.selected_by_percent}%</td>
+                                  <td className="px-3 py-3 text-center">
+                                    {playerStatus && playerStatus.status !== 'Available' ? (
+                                      <span className={`rounded-full px-2 py-1 text-xs font-semibold ${playerStatus.color}`}>
+                                        {playerStatus.icon}
+                                      </span>
+                                    ) : (
+                                      <span className="text-xs font-semibold text-green-600">Available</span>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
                       </div>
-                      
-                      {/* Table Body */}
-                      <div className="divide-y divide-gray-100">
+
+                      <div className="space-y-3 md:hidden">
                         {filteredPlayers.map((player) => {
                           const playerStatus = getPlayerStatus(player);
                           const isCurrentPlayer = currentPlayer?.id === player.id;
                           const isTempSelected = multiSelectMode && tempSelectedPlayers.some(p => p.id === player.id);
                           const isAlreadyInTeam = selectedPlayers.some(p => p.id === player.id);
-                          
+                          const isDisabled = isAlreadyInTeam && !isCurrentPlayer && !isTempSelected;
+
                           return (
                             <button
                               key={player.id}
-                              onClick={() => handlePlayerSelect(player)}
-                              disabled={isAlreadyInTeam && !isCurrentPlayer}
+                              onClick={() => {
+                                if (isDisabled) return;
+                                handlePlayerSelect(player);
+                              }}
+                              disabled={isDisabled}
                               className={classNames(
-                                'w-full px-6 py-4 text-left transition-colors',
-                                isTempSelected ? 'bg-green-100 border-l-4 border-green-500' : '',
-                                isCurrentPlayer ? 'bg-blue-100 border-l-4 border-blue-500' : '',
-                                isAlreadyInTeam && !isCurrentPlayer ? 'opacity-50 cursor-not-allowed bg-gray-100' : 'hover:bg-blue-50',
-                                !isTempSelected && !isCurrentPlayer && !isAlreadyInTeam ? '' : ''
+                                'w-full rounded-2xl border border-slate-200 bg-white p-4 text-left shadow-sm transition-colors',
+                                isDisabled ? 'opacity-60' : 'hover:border-blue-200',
+                                isTempSelected ? 'border-green-300 bg-green-50' : '',
+                                isCurrentPlayer ? 'border-blue-300 bg-blue-50' : ''
                               )}
                             >
-                              <div className="grid grid-cols-12 gap-4 items-center">
-                                {/* Player Photo */}
-                                <div className="col-span-1">
-                                  <div className={`w-10 h-10 rounded-full flex items-center justify-center text-sm font-bold ${getPositionColor(player.position)}`}>
-                                    {player.photo ? (
-                                      <img 
-                                        src={`https://resources.premierleague.com/premierleague/photos/players/250x250/p${player.code}.png`}
-                                        alt={player.web_name}
-                                        className="w-10 h-10 rounded-full object-cover"
-                                        onError={(e) => {
-                                          e.currentTarget.style.display = 'none';
-                                          e.currentTarget.nextElementSibling.style.display = 'flex';
-                                        }}
-                                      />
-                                    ) : null}
-                                    <span className={player.photo ? 'hidden' : 'block'}>
-                                      {getPositionIcon(player.position)}
-                                    </span>
-                                  </div>
+                              <div className="flex items-center justify-between">
+                                <div>
+                                  <p className="text-base font-semibold text-slate-900">{player.web_name}</p>
+                                  <p className="text-xs text-slate-500">{player.team_name}</p>
                                 </div>
-                                
-                                {/* Player Name */}
-                                <div className="col-span-3">
-                                  <div className="flex items-center space-x-2">
-                                    {multiSelectMode && (
-                                      <input
-                                        type="checkbox"
-                                        checked={isTempSelected}
-                                        onChange={() => {}}
-                                        className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
-                                      />
-                                    )}
-                                    <div className="font-semibold text-gray-900">
-                                      {player.web_name}
-                                    </div>
-                                    {isTempSelected && (
-                                      <span className="bg-green-500 text-white text-xs px-2 py-1 rounded-full">
-                                        ✓ Selected
-                                      </span>
-                                    )}
-                                    {isCurrentPlayer && (
-                                      <span className="bg-blue-500 text-white text-xs px-2 py-1 rounded-full">
-                                        Current
-                                      </span>
-                                    )}
-                                    {isAlreadyInTeam && !isCurrentPlayer && (
-                                      <span className="bg-gray-400 text-white text-xs px-2 py-1 rounded-full">
-                                        In Team
-                                      </span>
-                                    )}
-                                  </div>
-                                  <div className="text-sm text-gray-500">
-                                    {player.first_name} {player.second_name}
-                                  </div>
-                                </div>
-                                
-                                {/* Team */}
-                                <div className="col-span-2">
-                                  <div className="font-medium text-gray-900">
-                                    {player.team_name}
-                                  </div>
-                                </div>
-                                
-                                {/* Price */}
-                                <div className="col-span-1 text-center">
-                                  <div className="text-lg font-bold text-green-600">
-                                    {formatPrice(player.now_cost)}
-                                  </div>
-                                </div>
-                                
-                                {/* Points */}
-                                <div className="col-span-1 text-center">
-                                  <div className="font-semibold text-gray-900">
-                                    {player.total_points}
-                                  </div>
-                                </div>
-                                
-                                {/* Form */}
-                                <div className="col-span-1 text-center">
-                                  <div className="font-semibold text-blue-600">
-                                    {player.form}
-                                  </div>
-                                </div>
-                                
-                                {/* Selected By */}
-                                <div className="col-span-2 text-center">
-                                  <div className="text-sm text-gray-600">
-                                    {player.selected_by_percent}%
-                                  </div>
-                                </div>
-                                
-                                {/* Status */}
-                                <div className="col-span-1 text-center">
-                                  {playerStatus && playerStatus.status !== 'Available' ? (
-                                    <span className={`text-xs px-2 py-1 rounded-full ${playerStatus.color}`}>
-                                      {playerStatus.icon}
-                                    </span>
-                                  ) : (
-                                    <span className="text-green-500 text-xs">✓</span>
-                                  )}
-                                </div>
+                                <div className="text-right text-sm font-semibold text-slate-900">{formatPrice(player.now_cost)}</div>
+                              </div>
+                              <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
+                                <span>{player.position}</span>
+                                <span>{player.total_points} pts</span>
+                                <span>{player.form} form</span>
+                                <span>{player.selected_by_percent}% EO</span>
+                              </div>
+                              <div className="mt-2">
+                                {playerStatus && playerStatus.status !== 'Available' ? (
+                                  <span className={`rounded-full px-2 py-1 text-xs font-semibold ${playerStatus.color}`}>
+                                    {playerStatus.status}
+                                  </span>
+                                ) : (
+                                  <span className="rounded-full bg-green-50 px-2 py-1 text-xs font-semibold text-green-600">
+                                    Available
+                                  </span>
+                                )}
                               </div>
                             </button>
                           );
                         })}
                       </div>
-                    </div>
+                    </>
                   )}
                 </div>
 

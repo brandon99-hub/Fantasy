@@ -2,7 +2,7 @@ import sqlite3
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any
 import logging
 from pathlib import Path
 
@@ -17,6 +17,31 @@ class FPLDatabase:
         self.db_path = db_path or settings.DATABASE_PATH
         self.logger = logging.getLogger(__name__)
         self._initialize_database()
+
+    def _prepare_dataframe_for_insert(self, conn, table_name: str, df: pd.DataFrame) -> pd.DataFrame:
+        """Align dataframe columns with target table schema (excluding primary key)."""
+        table_info = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        valid_cols = [row[1] for row in table_info if row[1] != 'id']
+        aligned = df.copy()
+        for col in valid_cols:
+            if col not in aligned.columns:
+                aligned[col] = None
+        aligned = aligned[valid_cols]
+        return aligned
+
+    def _delete_conflicting_rows(self, conn, table_name: str, unique_cols: List[str], df: pd.DataFrame) -> None:
+        """Remove existing rows that would conflict with new inserts."""
+        if any(col not in df.columns for col in unique_cols):
+            return
+        keys_df = df[unique_cols].dropna()
+        if keys_df.empty:
+            return
+        placeholders = " AND ".join(f"{col}=?" for col in unique_cols)
+        query = f"DELETE FROM {table_name} WHERE {placeholders}"
+        params = [tuple(row) for row in keys_df.drop_duplicates().itertuples(index=False, name=None)]
+        if not params:
+            return
+        conn.executemany(query, params)
     
     def _initialize_database(self):
         """Create database tables if they don't exist"""
@@ -225,6 +250,24 @@ class FPLDatabase:
                 )
             """)
             
+            # Fixture odds table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS fixture_odds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fixture_id INTEGER UNIQUE,
+                    event INTEGER,
+                    home_team INTEGER,
+                    away_team INTEGER,
+                    bookmaker TEXT,
+                    market TEXT,
+                    home_implied_goals REAL,
+                    away_implied_goals REAL,
+                    raw_odds TEXT,
+                    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (fixture_id) REFERENCES fixtures (id)
+                )
+            """)
+            
             # Player gameweek stats table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS player_gameweek_stats (
@@ -249,6 +292,15 @@ class FPLDatabase:
                     threat REAL,
                     ict_index REAL,
                     clearances_blocks_interceptions INTEGER,
+                    defensive_contribution INTEGER,
+                    recoveries INTEGER,
+                    tackles INTEGER,
+                    starts INTEGER,
+                    expected_goals REAL,
+                    expected_assists REAL,
+                    expected_goal_involvements REAL,
+                    expected_goals_conceded REAL,
+                    in_dreamteam BOOLEAN,
                     total_points INTEGER,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (element) REFERENCES players (id),
@@ -288,6 +340,20 @@ class FPLDatabase:
                     creativity REAL,
                     threat REAL,
                     ict_index REAL,
+                    clearances_blocks_interceptions INTEGER,
+                    defensive_contribution INTEGER,
+                    recoveries INTEGER,
+                    tackles INTEGER,
+                    expected_goals REAL,
+                    expected_assists REAL,
+                    expected_goal_involvements REAL,
+                    expected_goals_conceded REAL,
+                    starts INTEGER,
+                    team_a_score INTEGER,
+                    team_h_score INTEGER,
+                    fixture INTEGER,
+                    kickoff_time TEXT,
+                    modified TEXT,
                     opponent_team INTEGER,
                     was_home BOOLEAN,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -302,12 +368,26 @@ class FPLDatabase:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     element INTEGER,
                     event INTEGER,
+                    code INTEGER,
+                    fixture_id INTEGER,
+                    team_h INTEGER,
+                    team_a INTEGER,
                     is_home BOOLEAN,
+                    opponent_team INTEGER,
+                    kickoff_time TEXT,
                     difficulty INTEGER,
+                    team_h_difficulty INTEGER,
+                    team_a_difficulty INTEGER,
+                    event_name TEXT,
+                    finished BOOLEAN,
+                    provisional_start_time BOOLEAN,
+                    minutes INTEGER,
+                    team_h_score INTEGER,
+                    team_a_score INTEGER,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (element) REFERENCES players (id),
                     FOREIGN KEY (event) REFERENCES gameweeks (id),
-                    UNIQUE(element, event)
+                    UNIQUE(element, event, code)
                 )
             """)
             
@@ -318,6 +398,28 @@ class FPLDatabase:
                     value TEXT,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
+            """)
+
+            # Model metrics registry
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS model_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_name TEXT NOT NULL,
+                    version TEXT,
+                    train_start_gw INTEGER,
+                    train_end_gw INTEGER,
+                    validation_gw INTEGER,
+                    test_gw INTEGER,
+                    mae REAL,
+                    rmse REAL,
+                    r2 REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    artifact_path TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_model_metrics_model
+                ON model_metrics(model_name, created_at DESC)
             """)
             
             # Create indexes for performance
@@ -438,8 +540,9 @@ class FPLDatabase:
         """Update player gameweek statistics"""
         try:
             with sqlite3.connect(self.db_path) as conn:
-                # Insert or replace data
-                stats_df.to_sql('player_gameweek_stats', conn, if_exists='append', index=False)
+                prepared_df = self._prepare_dataframe_for_insert(conn, 'player_gameweek_stats', stats_df)
+                self._delete_conflicting_rows(conn, 'player_gameweek_stats', ['element', 'gameweek'], prepared_df)
+                prepared_df.to_sql('player_gameweek_stats', conn, if_exists='append', index=False)
                 
                 # Remove duplicates (keep latest)
                 conn.execute("""
@@ -462,8 +565,9 @@ class FPLDatabase:
         """Update player historical data"""
         try:
             with sqlite3.connect(self.db_path) as conn:
-                # Insert or replace data
-                history_df.to_sql('player_history', conn, if_exists='append', index=False)
+                prepared_df = self._prepare_dataframe_for_insert(conn, 'player_history', history_df)
+                self._delete_conflicting_rows(conn, 'player_history', ['element', 'round'], prepared_df)
+                prepared_df.to_sql('player_history', conn, if_exists='append', index=False)
                 
                 # Remove duplicates
                 conn.execute("""
@@ -486,7 +590,10 @@ class FPLDatabase:
         """Update player upcoming fixtures"""
         try:
             with sqlite3.connect(self.db_path) as conn:
-                fixtures_df.to_sql('player_fixtures', conn, if_exists='append', index=False)
+                fixtures_df = fixtures_df.rename(columns={'id': 'fixture_id'})
+                prepared_df = self._prepare_dataframe_for_insert(conn, 'player_fixtures', fixtures_df)
+                self._delete_conflicting_rows(conn, 'player_fixtures', ['element', 'event', 'code'], prepared_df)
+                prepared_df.to_sql('player_fixtures', conn, if_exists='append', index=False)
                 
                 # Remove duplicates
                 conn.execute("""
@@ -494,7 +601,7 @@ class FPLDatabase:
                     WHERE id NOT IN (
                         SELECT MAX(id) 
                         FROM player_fixtures 
-                        GROUP BY element, event
+                        GROUP BY element, event, code
                     )
                 """)
                 
@@ -588,6 +695,77 @@ class FPLDatabase:
             self.logger.error(f"Error getting price changes: {str(e)}")
             return pd.DataFrame()
     
+    def upsert_fixture_odds(self, odds_records: List[Dict[str, Any]]) -> bool:
+        """Insert or update fixture odds from bookmaker data."""
+        if not odds_records:
+            return False
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                for record in odds_records:
+                    cursor.execute(
+                        """
+                        INSERT INTO fixture_odds (
+                            fixture_id, event, home_team, away_team,
+                            bookmaker, market, home_implied_goals, away_implied_goals, raw_odds, fetched_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(fixture_id) DO UPDATE SET
+                            event=excluded.event,
+                            home_team=excluded.home_team,
+                            away_team=excluded.away_team,
+                            bookmaker=excluded.bookmaker,
+                            market=excluded.market,
+                            home_implied_goals=excluded.home_implied_goals,
+                            away_implied_goals=excluded.away_implied_goals,
+                            raw_odds=excluded.raw_odds,
+                            fetched_at=CURRENT_TIMESTAMP
+                        """,
+                        (
+                            record.get('fixture_id'),
+                            record.get('event'),
+                            record.get('home_team'),
+                            record.get('away_team'),
+                            record.get('bookmaker'),
+                            record.get('market'),
+                            record.get('home_implied_goals'),
+                            record.get('away_implied_goals'),
+                            record.get('raw_odds'),
+                        )
+                    )
+            return True
+        except Exception as e:
+            self.logger.error(f"Error upserting fixture odds: {str(e)}")
+            return False
+    
+    def get_fixture_odds_map(self) -> Dict[int, Dict[str, Any]]:
+        """Return latest odds indexed by fixture_id."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                rows = cursor.execute("""
+                    SELECT fixture_id, event, home_team, away_team,
+                           bookmaker, market, home_implied_goals, away_implied_goals, raw_odds, fetched_at
+                    FROM fixture_odds
+                """).fetchall()
+            odds_map = {}
+            for row in rows:
+                odds_map[row[0]] = {
+                    'fixture_id': row[0],
+                    'event': row[1],
+                    'home_team': row[2],
+                    'away_team': row[3],
+                    'bookmaker': row[4],
+                    'market': row[5],
+                    'home_implied_goals': row[6],
+                    'away_implied_goals': row[7],
+                    'raw_odds': row[8],
+                    'fetched_at': row[9]
+                }
+            return odds_map
+        except Exception as e:
+            self.logger.error(f"Error retrieving fixture odds: {str(e)}")
+            return {}
+    
     def get_active_player_ids(self) -> List[int]:
         """Get IDs of all active players"""
         try:
@@ -597,6 +775,37 @@ class FPLDatabase:
                 return [row[0] for row in cursor.fetchall()]
         except Exception as e:
             self.logger.error(f"Error getting active player IDs: {str(e)}")
+            return []
+    
+    def get_trackable_player_ids(self) -> List[int]:
+        """Get IDs for all players that should have history tracked (not unavailable)."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id FROM players WHERE status != 'u' OR status IS NULL")
+                return [row[0] for row in cursor.fetchall()]
+        except Exception as e:
+            self.logger.error(f"Error getting trackable player IDs: {str(e)}")
+            return []
+    
+    def get_players_missing_history(self) -> List[int]:
+        """Get player IDs that lack any stored history rows."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT p.id
+                    FROM players p
+                    LEFT JOIN (
+                        SELECT DISTINCT element
+                        FROM player_history
+                    ) ph ON p.id = ph.element
+                    WHERE (p.status != 'u' OR p.status IS NULL)
+                      AND ph.element IS NULL
+                """)
+                return [row[0] for row in cursor.fetchall()]
+        except Exception as e:
+            self.logger.error(f"Error getting players missing history: {str(e)}")
             return []
     
     def get_teams(self) -> pd.DataFrame:
@@ -682,6 +891,81 @@ class FPLDatabase:
         except Exception as e:
             self.logger.error(f"Error getting player history: {str(e)}")
             return pd.DataFrame()
+
+    def save_model_metrics(
+        self,
+        model_name: str,
+        version: str,
+        train_start_gw: int,
+        train_end_gw: int,
+        validation_gw: int,
+        test_gw: int,
+        metrics: Dict[str, float],
+        artifact_path: Optional[str] = None
+    ) -> bool:
+        """Persist model evaluation metrics"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO model_metrics (
+                        model_name, version, train_start_gw, train_end_gw,
+                        validation_gw, test_gw, mae, rmse, r2, artifact_path
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        model_name,
+                        version,
+                        train_start_gw,
+                        train_end_gw,
+                        validation_gw,
+                        test_gw,
+                        metrics.get('mae'),
+                        metrics.get('rmse'),
+                        metrics.get('r2'),
+                        artifact_path
+                    )
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            self.logger.error(f"Error saving model metrics: {str(e)}")
+            return False
+
+    def get_latest_model_metrics(self, model_name: Optional[str] = None) -> Dict[str, Dict[str, float]]:
+        """Fetch latest metrics for all models or a specific model"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                if model_name:
+                    cursor.execute(
+                        """
+                        SELECT * FROM model_metrics
+                        WHERE model_name = ?
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        (model_name,)
+                    )
+                    row = cursor.fetchone()
+                    return {model_name: dict(row)} if row else {}
+
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM model_metrics
+                    WHERE id IN (
+                        SELECT MAX(id) FROM model_metrics GROUP BY model_name
+                    )
+                    """
+                )
+                rows = cursor.fetchall()
+                return {row['model_name']: dict(row) for row in rows}
+        except Exception as e:
+            self.logger.error(f"Error fetching model metrics: {str(e)}")
+            return {}
     
     def mark_last_update(self) -> bool:
         """Mark the time of last data update"""

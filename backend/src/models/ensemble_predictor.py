@@ -3,28 +3,26 @@ Advanced ensemble prediction models for FPL
 Combines multiple ML algorithms with proper cross-validation and uncertainty quantification
 """
 
-import pandas as pd
+import logging
+import pickle
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Union
+
 import numpy as np
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, VotingRegressor
-from sklearn.linear_model import Ridge, Lasso
-from sklearn.neural_network import MLPRegressor
-from sklearn.model_selection import TimeSeriesSplit, cross_val_score
-from sklearn.preprocessing import StandardScaler, RobustScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel
-try:
-    import xgboost as xgb
-    import lightgbm as lgb
-    HAS_ADVANCED_MODELS = True
-except ImportError:
-    HAS_ADVANCED_MODELS = False
-import pickle
-import logging
-from typing import Dict, List, Optional, Tuple, Union
-from datetime import datetime
-import warnings
-warnings.filterwarnings('ignore')
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import RobustScaler, StandardScaler
+
+from backend.src.core.config import get_settings
+from backend.src.core.database import FPLDatabase
+from backend.src.core.training_data import TrainingDataBuilder
+from backend.src.models.minutes_model import MinutesPredictor
 
 class EnsemblePredictor:
     """Advanced ensemble prediction system for FPL points"""
@@ -37,6 +35,12 @@ class EnsemblePredictor:
         self.feature_names = []
         self.model_weights = {}
         self.uncertainty_estimator = None
+        self.builder = TrainingDataBuilder(lookback_gws=5)
+        self.minutes_model = MinutesPredictor()
+        self.settings = get_settings()
+        self.db = FPLDatabase()
+        self.model_version: Optional[str] = None
+        self.calibration_factor: float = 1.0
         
         # Model configurations
         self.model_configs = {
@@ -72,272 +76,144 @@ class EnsemblePredictor:
                 'weight': 0.20
             }
         }
-        
-        # Add advanced models if available
-        if HAS_ADVANCED_MODELS:
-            self.model_configs.update({
-                'xgboost': {
-                    'model': xgb.XGBRegressor(
-                        n_estimators=200,
-                        learning_rate=0.1,
-                        max_depth=6,
-                        subsample=0.8,
-                        random_state=42
-                    ),
-                    'weight': 0.15
-                },
-                'lightgbm': {
-                    'model': lgb.LGBMRegressor(
-                        n_estimators=200,
-                        learning_rate=0.1,
-                        max_depth=6,
-                        subsample=0.8,
-                        random_state=42,
-                        verbose=-1
-                    ),
-                    'weight': 0.05
-                }
-            })
     
-    def _create_advanced_features(self, df: pd.DataFrame, 
-                                 minutes_predictions: pd.DataFrame = None,
-                                 fixture_analysis: pd.DataFrame = None) -> pd.DataFrame:
-        """Create advanced features for ensemble prediction"""
-        try:
-            features = df.copy()
-            
-            # Merge minutes predictions if provided
-            if minutes_predictions is not None and not minutes_predictions.empty:
-                features = features.merge(
-                    minutes_predictions[['player_id', 'expected_minutes', 'start_probability']],
-                    left_on='id', right_on='player_id', how='left'
-                )
-            else:
-                features['expected_minutes'] = features.get('minutes', 0)
-                features['start_probability'] = (features.get('minutes', 0) > 60).astype(int)
-            
-            # Fill missing values
-            features['expected_minutes'] = features['expected_minutes'].fillna(0)
-            features['start_probability'] = features['start_probability'].fillna(0)
-            
-            # Basic performance features
-            numeric_features = [
-                'form', 'total_points', 'points_per_game', 'goals_scored', 'assists',
-                'clean_sheets', 'bonus', 'bps', 'ict_index', 'influence', 
-                'creativity', 'threat', 'selected_by_percent'
-            ]
-            
-            for feature in numeric_features:
-                if feature in features.columns:
-                    features[feature] = pd.to_numeric(features[feature], errors='coerce').fillna(0)
-            
-            # Position encoding
-            if 'position' in features.columns:
-                position_dummies = pd.get_dummies(features['position'], prefix='pos')
-                features = pd.concat([features, position_dummies], axis=1)
-            
-            # Price and value features
-            if 'now_cost' in features.columns:
-                features['price_value'] = features['now_cost'] / 10.0
-                features['value_ratio'] = features['total_points'] / (features['now_cost'] + 1)
-                features['price_per_point'] = features['now_cost'] / (features['total_points'] + 1)
-            
-            # Advanced performance metrics
-            features['goals_per_90'] = (features['goals_scored'] * 90) / (features['minutes'] + 1)
-            features['assists_per_90'] = (features['assists'] * 90) / (features['minutes'] + 1)
-            features['points_per_90'] = (features['total_points'] * 90) / (features['minutes'] + 1)
-            
-            # Consistency metrics
-            features['form_consistency'] = features['form'] / (features['points_per_game'] + 1)
-            features['performance_variance'] = features['form'] - features['points_per_game']
-            
-            # Team strength features
-            team_strength_cols = [
-                'strength_overall_home', 'strength_overall_away',
-                'strength_attack_home', 'strength_attack_away', 
-                'strength_defence_home', 'strength_defence_away'
-            ]
-            for col in team_strength_cols:
-                if col in features.columns:
-                    features[col] = features[col].fillna(3)
-            
-            # Availability and injury risk
-            if 'chance_of_playing_this_round' in features.columns:
-                features['availability'] = features['chance_of_playing_this_round'].fillna(100) / 100
-            else:
-                features['availability'] = 1.0
-            
-            # Ownership features
-            if 'selected_by_percent' in features.columns:
-                features['ownership_percentile'] = features['selected_by_percent'].rank(pct=True)
-                features['is_differential'] = (features['selected_by_percent'] < 5).astype(int)
-                features['is_highly_owned'] = (features['selected_by_percent'] > 20).astype(int)
-            
-            # Transfer momentum
-            if 'transfers_in_event' in features.columns and 'transfers_out_event' in features.columns:
-                features['net_transfers'] = features['transfers_in_event'] - features['transfers_out_event']
-                features['transfer_momentum'] = features['net_transfers'] / (features['selected_by_percent'] + 1)
-            
-            # Fixture analysis integration
-            if fixture_analysis is not None and not fixture_analysis.empty:
-                features = features.merge(
-                    fixture_analysis[['team_id', 'avg_difficulty', 'has_double_gameweek', 'rotation_risk']],
-                    left_on='team', right_on='team_id', how='left'
-                )
-                features['avg_difficulty'] = features['avg_difficulty'].fillna(3.0)
-                features['has_double_gameweek'] = features['has_double_gameweek'].fillna(False)
-                features['rotation_risk'] = features['rotation_risk'].fillna(0.1)
-            
-            # Interaction features
-            features['form_x_availability'] = features['form'] * features['availability']
-            features['points_x_difficulty'] = features['total_points'] * (1 / features.get('avg_difficulty', 3.0))
-            features['minutes_x_start_prob'] = features['expected_minutes'] * features['start_probability']
-            
-            # Select final features
-            model_features = [
-                'expected_minutes', 'start_probability', 'form', 'total_points',
-                'points_per_game', 'goals_scored', 'assists', 'clean_sheets',
-                'bonus', 'bps', 'ict_index', 'influence', 'creativity', 'threat',
-                'selected_by_percent', 'price_value', 'value_ratio', 'price_per_point',
-                'goals_per_90', 'assists_per_90', 'points_per_90', 'form_consistency',
-                'performance_variance', 'availability', 'ownership_percentile',
-                'is_differential', 'is_highly_owned', 'net_transfers', 'transfer_momentum',
-                'form_x_availability', 'points_x_difficulty', 'minutes_x_start_prob'
-            ]
-            
-            # Add optional fixture analysis features if available
-            # Only add them if they were present during training
-            if hasattr(self, 'feature_names') and self.feature_names:
-                # Only use features that were present during training
-                optional_features = ['avg_difficulty', 'has_double_gameweek', 'rotation_risk']
-                for feature in optional_features:
-                    if feature in features.columns and feature in self.feature_names:
-                        model_features.append(feature)
-            else:
-                # During training, add all available optional features
-                optional_features = ['avg_difficulty', 'has_double_gameweek', 'rotation_risk']
-                for feature in optional_features:
-                    if feature in features.columns:
-                        model_features.append(feature)
-            
-            # Add position dummies
-            pos_cols = [col for col in features.columns if col.startswith('pos_')]
-            model_features.extend(pos_cols)
-            
-            # Add team strength features
-            available_strength_cols = [col for col in team_strength_cols if col in features.columns]
-            model_features.extend(available_strength_cols)
-            
-            # Keep only available features
-            available_features = [col for col in model_features if col in features.columns]
-            result = features[available_features].fillna(0)
-            
-            self.feature_names = available_features
-            return result
-            
-        except Exception as e:
-            self.logger.error(f"Error creating advanced features: {str(e)}")
+    def _get_feature_columns(self) -> List[str]:
+        if not self.feature_names:
+            self.feature_names = self.builder.get_feature_columns()
+        return self.feature_names
+
+    def _build_feature_frame(self, players_df: pd.DataFrame) -> pd.DataFrame:
+        feature_frame = self.builder.build_prediction_features(players_df["id"].tolist())
+        if feature_frame.empty:
             return pd.DataFrame()
+        feature_cols = self._get_feature_columns()
+        return feature_frame[["player_id", *feature_cols]]
     
-    def _prepare_training_data(self) -> Tuple[pd.DataFrame, pd.Series]:
-        """Prepare training data from current season data"""
+    def _prepare_training_data(self) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
+        """Prepare training data from historical player history."""
         try:
-            from backend.src.core.database import FPLDatabase
-            db = FPLDatabase()
-            
-            # Use current season data directly
-            players_df = db.get_players_with_stats()
-            
-            if players_df.empty:
-                self.logger.error("No player data available for training")
-                return pd.DataFrame(), pd.Series()
-            
-            # Use current season data as training data
-            merged_data = players_df.copy()
-            
-            # Use total_points as target (current season performance)
-            y = merged_data['total_points'].fillna(0)
-            
-            # Create features from current data
-            X = self._create_advanced_features(merged_data)
-            
-            if X.empty or len(y) == 0:
-                self.logger.warning("No valid training data for ensemble model")
-                return pd.DataFrame(), pd.Series()
-            
-            self.logger.info(f"Prepared ensemble training data from current season: {len(X)} samples, {len(X.columns)} features")
-            return X, y
-            
+            dataset = self.builder.build_points_training_set()
+            if dataset.empty:
+                self.logger.error("No historical data available for ensemble training")
+                return pd.DataFrame(), pd.Series(dtype=float), pd.Series(dtype=int)
+
+            feature_cols = self._get_feature_columns()
+            X = dataset[feature_cols].fillna(0)
+            y = dataset["points_target"]
+            rounds = dataset["round"]
+            self.logger.info(
+                "Prepared ensemble training data: %d samples, %d features",
+                len(X),
+                len(feature_cols),
+            )
+            return X, y, rounds
+
         except Exception as e:
             self.logger.error(f"Error preparing ensemble training data: {str(e)}")
-            return pd.DataFrame(), pd.Series()
+            return pd.DataFrame(), pd.Series(dtype=float), pd.Series(dtype=int)
     
     def train(self, retrain: bool = False) -> bool:
-        """Train the ensemble model with proper cross-validation"""
+        """Train the ensemble model with chronological splits."""
         try:
             if self.is_fitted and not retrain:
                 self.logger.info("Ensemble model already trained. Use retrain=True to retrain.")
                 return True
-            
+
             self.logger.info("Starting ensemble model training...")
-            
-            # Prepare training data
-            X, y = self._prepare_training_data()
-            
-            if X.empty:
-                self.logger.error("No training data available for ensemble model")
+            data_tuple = self._prepare_training_data()
+            if data_tuple[0].empty:
                 return False
-            
-            # Use time series split for proper validation
-            tscv = TimeSeriesSplit(n_splits=5)
-            
-            # Train individual models
+
+            X, y, rounds = data_tuple
+            feature_cols = self._get_feature_columns()
+            dataset = pd.DataFrame(X, columns=feature_cols)
+            dataset["points_target"] = y.values
+            dataset["round"] = rounds.values
+
+            splits = self.builder.split_by_gameweek(dataset)
+            if not splits.train_rounds or not splits.test_rounds:
+                self.logger.error("Insufficient rounds for ensemble training splits")
+                return False
+
+            train_mask = dataset["round"].isin(splits.train_rounds)
+            val_mask = dataset["round"].isin(splits.validation_rounds)
+            test_mask = dataset["round"].isin(splits.test_rounds)
+
+            if not val_mask.any():
+                val_mask = train_mask
+
+            X_train = dataset.loc[train_mask, feature_cols]
+            y_train = dataset.loc[train_mask, "points_target"]
+            X_val = dataset.loc[val_mask, feature_cols]
+            y_val = dataset.loc[val_mask, "points_target"]
+            X_test = dataset.loc[test_mask, feature_cols]
+            y_test = dataset.loc[test_mask, "points_target"]
+            if X_test.empty:
+                X_test = X_val
+                y_test = y_val
+
             model_scores = {}
-            
             for name, config in self.model_configs.items():
-                self.logger.info(f"Training {name}...")
-                
-                model = config['model']
+                self.logger.info("Training %s...", name)
+                model = config["model"]
                 scaler = RobustScaler()
-                
-                # Cross-validation scores
-                cv_scores = cross_val_score(
-                    model, X, y, cv=tscv, scoring='neg_mean_absolute_error', n_jobs=-1
-                )
-                
-                # Train on full data
-                X_scaled = scaler.fit_transform(X)
-                model.fit(X_scaled, y)
-                
-                # Store model and scaler
+                X_train_scaled = scaler.fit_transform(X_train)
+                model.fit(X_train_scaled, y_train)
                 self.models[name] = model
                 self.scalers[name] = scaler
-                
-                # Calculate performance
-                avg_score = -cv_scores.mean()
-                model_scores[name] = avg_score
-                
-                self.logger.info(f"{name} - CV MAE: {avg_score:.3f} (+/- {cv_scores.std() * 2:.3f})")
+
+                val_pred = model.predict(scaler.transform(X_val))
+                mae = mean_absolute_error(y_val, val_pred)
+                model_scores[name] = mae
+                self.logger.info("%s validation MAE: %.3f", name, mae)
+
+            inv_scores = {name: 1 / (score + 1e-6) for name, score in model_scores.items()}
+            total_weight = sum(inv_scores.values())
+            self.model_weights = {name: score / total_weight for name, score in inv_scores.items()}
+            self.logger.info("Model weights: %s", self.model_weights)
+
+            test_predictions = {}
+            for name, model in self.models.items():
+                scaler = self.scalers[name]
+                test_predictions[name] = model.predict(scaler.transform(X_test))
+
+            ensemble_pred = np.zeros(len(X_test))
+            for name, pred in test_predictions.items():
+                ensemble_pred += self.model_weights.get(name, 0) * pred
+
+            mae = mean_absolute_error(y_test, ensemble_pred)
+            rmse = np.sqrt(mean_squared_error(y_test, ensemble_pred))
+            r2 = r2_score(y_test, ensemble_pred)
             
-            # Calculate model weights based on performance
-            total_score = sum(model_scores.values())
-            for name, score in model_scores.items():
-                self.model_weights[name] = (total_score - score) / (total_score * (len(model_scores) - 1))
-            
-            # Normalize weights
-            total_weight = sum(self.model_weights.values())
-            for name in self.model_weights:
-                self.model_weights[name] /= total_weight
-            
-            self.logger.info(f"Model weights: {self.model_weights}")
-            
-            # Train uncertainty estimator
-            self._train_uncertainty_estimator(X, y)
-            
+            # Calibrate predictions to match actual distribution (Platt-style scaling)
+            actual_mean = float(y_test.mean())
+            pred_mean = float(np.mean(ensemble_pred)) if len(ensemble_pred) else 1.0
+            calibration_factor = actual_mean / pred_mean if pred_mean > 0 else 1.0
+            calibration_factor = float(np.clip(calibration_factor, 0.5, 3.0))
+            self.calibration_factor = calibration_factor
+            self.logger.info(
+                "Ensemble evaluation — MAE: %.2f, RMSE: %.2f, R2: %.3f", mae, rmse, r2
+            )
+
+            self._train_uncertainty_estimator(pd.DataFrame(X_train, columns=feature_cols), y_train)
+
             self.is_fitted = True
-            self.logger.info("Ensemble model training completed successfully")
+            artifact_path = str(self.settings.ML_MODELS_DIR / "ensemble_model.pkl")
+            self.model_version = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+            self.save_model(artifact_path)
+            self.db.save_model_metrics(
+                model_name="ensemble_model",
+                version=self.model_version,
+                train_start_gw=splits.train_rounds[0],
+                train_end_gw=splits.train_rounds[-1],
+                validation_gw=splits.validation_rounds[-1] if splits.validation_rounds else None,
+                test_gw=splits.test_rounds[-1] if splits.test_rounds else None,
+                metrics={"mae": mae, "rmse": rmse, "r2": r2},
+                artifact_path=artifact_path,
+            )
+
             return True
-            
+
         except Exception as e:
             self.logger.error(f"Error training ensemble model: {str(e)}")
             return False
@@ -372,69 +248,64 @@ class EnsemblePredictor:
             self.logger.error(f"Error training uncertainty estimator: {str(e)}")
             self.uncertainty_estimator = None
     
-    def predict_points(self, players_df: pd.DataFrame, 
-                      minutes_predictions: pd.DataFrame = None,
-                      fixture_analysis: pd.DataFrame = None) -> pd.DataFrame:
-        """Predict points using ensemble of models"""
+    def predict_points(
+        self,
+        players_df: pd.DataFrame,
+        minutes_predictions: pd.DataFrame = None,
+        fixture_analysis: pd.DataFrame = None,
+    ) -> pd.DataFrame:
+        """Predict points using the trained ensemble."""
         try:
-            if not self.is_fitted:
-                self.logger.warning("Ensemble model not trained. Training now...")
-                if not self.train():
-                    self.logger.error("Failed to train ensemble model")
-                    return pd.DataFrame()
-            
-            # Create features
-            X = self._create_advanced_features(players_df, minutes_predictions, fixture_analysis)
-            
-            if X.empty:
-                self.logger.error("No features created for ensemble prediction")
+            if not self.is_fitted and not self.train():
                 return pd.DataFrame()
-            
-            # Get predictions from all models
+
+            feature_frame = self._build_feature_frame(players_df)
+            if feature_frame.empty:
+                self.logger.error("Unable to build features for ensemble prediction")
+                return pd.DataFrame()
+
+            feature_cols = self._get_feature_columns()
+            X = feature_frame[feature_cols].fillna(0)
+
             predictions = {}
             for name, model in self.models.items():
                 scaler = self.scalers[name]
-                X_scaled = scaler.transform(X)
-                pred = model.predict(X_scaled)
-                predictions[name] = pred
-            
-            # Calculate weighted ensemble prediction
+                predictions[name] = model.predict(scaler.transform(X))
+
             ensemble_pred = np.zeros(len(X))
             for name, pred in predictions.items():
-                weight = self.model_weights.get(name, 0)
-                ensemble_pred += weight * pred
-            
-            # Calculate uncertainty if available
+                ensemble_pred += self.model_weights.get(name, 0) * pred
+
             uncertainty = None
             if self.uncertainty_estimator is not None:
                 try:
                     X_gp_scaled = self.gp_scaler.transform(X)
-                    pred_mean, pred_std = self.uncertainty_estimator.predict(X_gp_scaled, return_std=True)
+                    _, pred_std = self.uncertainty_estimator.predict(X_gp_scaled, return_std=True)
                     uncertainty = pred_std
-                except Exception as e:
-                    self.logger.warning(f"Could not calculate uncertainty: {str(e)}")
-            
-            # Clip predictions to reasonable range
-            ensemble_pred = np.clip(ensemble_pred, 0, 25)
-            
-            # Create results
+                except Exception:
+                    self.logger.warning("Gaussian process uncertainty estimation failed")
+
+            minutes_pred = minutes_predictions
+            if minutes_pred is None:
+                minutes_pred = self.minutes_model.predict_minutes(players_df)
+
             results = players_df[['id', 'web_name', 'position', 'team_name', 'now_cost']].copy()
+            if minutes_pred is not None and not minutes_pred.empty:
+                results = results.merge(
+                    minutes_pred[['player_id', 'expected_minutes', 'start_probability']],
+                    left_on='id',
+                    right_on='player_id',
+                    how='left'
+                )
+
+            ensemble_pred = np.clip(ensemble_pred * self.calibration_factor, 0, 25)
             results['predicted_points'] = ensemble_pred
             results['points_per_million'] = results['predicted_points'] / (results['now_cost'] / 10.0)
-            
-            # Add confidence intervals
+
             if uncertainty is not None:
                 results['points_lower'] = np.maximum(0, ensemble_pred - 1.96 * uncertainty)
                 results['points_upper'] = ensemble_pred + 1.96 * uncertainty
                 results['uncertainty'] = uncertainty
-            else:
-                # Fallback confidence intervals
-                results['points_lower'] = np.maximum(0, ensemble_pred - 2.0)
-                results['points_upper'] = ensemble_pred + 2.0
-                results['uncertainty'] = 2.0
-            
-            # Risk categories based on uncertainty
-            if uncertainty is not None:
                 results['risk_category'] = pd.cut(
                     uncertainty,
                     bins=[0, 1.0, 2.0, 3.0, 10.0],
@@ -442,9 +313,11 @@ class EnsemblePredictor:
                     include_lowest=True
                 )
             else:
+                results['points_lower'] = np.maximum(0, ensemble_pred - 2.0)
+                results['points_upper'] = ensemble_pred + 2.0
+                results['uncertainty'] = 2.0
                 results['risk_category'] = 'Medium Risk'
-            
-            # Model agreement (variance of individual predictions)
+
             pred_array = np.array(list(predictions.values()))
             model_variance = np.var(pred_array, axis=0)
             results['model_agreement'] = pd.cut(
@@ -453,9 +326,9 @@ class EnsemblePredictor:
                 labels=['High Agreement', 'Medium Agreement', 'Low Agreement', 'Very Low Agreement'],
                 include_lowest=True
             )
-            
+
             return results.sort_values('predicted_points', ascending=False)
-            
+
         except Exception as e:
             self.logger.error(f"Error predicting points with ensemble: {str(e)}")
             return pd.DataFrame()

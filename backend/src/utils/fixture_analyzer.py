@@ -6,7 +6,7 @@ Handles fixture difficulty, double gameweeks, blank gameweeks, and rotation risk
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import logging
 
 class FixtureAnalyzer:
@@ -14,6 +14,8 @@ class FixtureAnalyzer:
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
+        self.head_to_head_cache: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+        self.max_head_to_head_samples = 5
         
         # Fixture difficulty weights (1-5 scale)
         self.difficulty_weights = {
@@ -32,6 +34,25 @@ class FixtureAnalyzer:
             'FWD': {'attack': 1.2, 'defence': 0.8}
         }
     
+    def _get_upcoming_window(self, fixtures_df: pd.DataFrame, gameweeks: int) -> pd.DataFrame:
+        """Return the slice of fixtures covering the next `gameweeks` unfinished rounds."""
+        fixtures = fixtures_df.copy()
+        if fixtures.empty:
+            return fixtures
+        
+        fixtures['finished'] = fixtures['finished'].astype(int)
+        unfinished = fixtures[fixtures['finished'] == 0]
+        
+        if not unfinished.empty:
+            next_event = unfinished['event'].min()
+            max_event = next_event + gameweeks - 1
+            return fixtures[(fixtures['event'] >= next_event) & (fixtures['event'] <= max_event)]
+        
+        # All fixtures finished (e.g., during off-season) - fallback to latest window
+        max_event = fixtures['event'].max()
+        min_event = max(fixtures['event'].min(), max_event - gameweeks + 1)
+        return fixtures[(fixtures['event'] >= min_event) & (fixtures['event'] <= max_event)]
+    
     def calculate_fixture_difficulty_score(self, 
                                          fixtures_df: pd.DataFrame, 
                                          team_strengths_df: pd.DataFrame,
@@ -41,11 +62,8 @@ class FixtureAnalyzer:
             if fixtures_df.empty or team_strengths_df.empty:
                 return pd.DataFrame()
             
-            # Get upcoming fixtures
-            upcoming = fixtures_df[
-                (fixtures_df['finished'] == False) & 
-                (fixtures_df['event'] <= fixtures_df['event'].min() + gameweeks - 1)
-            ].copy()
+            upcoming = self._get_upcoming_window(fixtures_df, gameweeks)
+            upcoming = upcoming[upcoming['finished'] == 0].copy()
             
             if upcoming.empty:
                 return pd.DataFrame()
@@ -225,6 +243,78 @@ class FixtureAnalyzer:
             self.logger.error(f"Error calculating position fixture difficulty: {str(e)}")
             return pd.DataFrame()
     
+    def _compute_head_to_head(self, fixtures_df: pd.DataFrame, home_team: int, away_team: int) -> Dict[str, Any]:
+        """Compute last N head-to-head stats for the pair."""
+        cache_key = (home_team, away_team, self.max_head_to_head_samples)
+        if cache_key in self.head_to_head_cache:
+            return self.head_to_head_cache[cache_key]
+        
+        past_meetings = fixtures_df[
+            (
+                ((fixtures_df['team_h'] == home_team) & (fixtures_df['team_a'] == away_team)) |
+                ((fixtures_df['team_h'] == away_team) & (fixtures_df['team_a'] == home_team))
+            ) &
+            (fixtures_df['finished'] == 1)
+        ].sort_values('event', ascending=False).head(self.max_head_to_head_samples)
+        
+        stats = {
+            'samples': len(past_meetings),
+            'home_wins': 0,
+            'away_wins': 0,
+            'draws': 0,
+            'home_goals_avg': 0.0,
+            'away_goals_avg': 0.0,
+            'trend': 'Balanced'
+        }
+        
+        if not past_meetings.empty:
+            home_wins = 0
+            away_wins = 0
+            draws = 0
+            home_goals = []
+            away_goals = []
+            
+            for _, row in past_meetings.iterrows():
+                home_score = row.get('team_h_score', 0) or 0
+                away_score = row.get('team_a_score', 0) or 0
+                home_is_home = row['team_h'] == home_team
+                
+                if home_is_home:
+                    home_goals.append(home_score)
+                    away_goals.append(away_score)
+                    if home_score > away_score:
+                        home_wins += 1
+                    elif away_score > home_score:
+                        away_wins += 1
+                    else:
+                        draws += 1
+                else:
+                    # Swap roles
+                    home_goals.append(away_score)
+                    away_goals.append(home_score)
+                    if away_score > home_score:
+                        home_wins += 1
+                    elif home_score > away_score:
+                        away_wins += 1
+                    else:
+                        draws += 1
+            
+            stats['home_wins'] = home_wins
+            stats['away_wins'] = away_wins
+            stats['draws'] = draws
+            stats['home_goals_avg'] = round(np.mean(home_goals), 2) if home_goals else 0.0
+            stats['away_goals_avg'] = round(np.mean(away_goals), 2) if away_goals else 0.0
+            
+            if home_wins > away_wins:
+                stats['trend'] = 'Home edge'
+            elif away_wins > home_wins:
+                stats['trend'] = 'Away edge'
+            else:
+                stats['trend'] = 'Balanced'
+        
+        self.head_to_head_cache[cache_key] = stats
+        return stats
+    
     def get_team_fixture_summary(self, 
                                 team_id: int, 
                                 fixtures_df: pd.DataFrame,
@@ -232,11 +322,11 @@ class FixtureAnalyzer:
                                 gameweeks: int = 5) -> Dict:
         """Get comprehensive fixture summary for a team"""
         try:
-            # Get team fixtures
-            team_fixtures = fixtures_df[
-                ((fixtures_df['team_h'] == team_id) | (fixtures_df['team_a'] == team_id)) &
-                (fixtures_df['finished'] == False) &
-                (fixtures_df['event'] <= fixtures_df['event'].min() + gameweeks - 1)
+            upcoming = self._get_upcoming_window(fixtures_df, gameweeks)
+            upcoming = upcoming[upcoming['finished'] == 0]
+            
+            team_fixtures = upcoming[
+                (upcoming['team_h'] == team_id) | (upcoming['team_a'] == team_id)
             ]
             
             if team_fixtures.empty:
@@ -249,12 +339,26 @@ class FixtureAnalyzer:
             ]
             
             # Calculate metrics
-            avg_difficulty = team_difficulty['home_difficulty_score'].mean() if not team_difficulty.empty else 3.0
+            avg_difficulty = team_difficulty[['home_difficulty_score', 'away_difficulty_score']].mean().mean() if not team_difficulty.empty else 3.0
             double_gws = self.detect_double_gameweeks(fixtures_df)
             has_double_gw = any(team_id in teams for teams in double_gws.values())
             
             # Rotation risk
             avg_rotation_risk = team_difficulty['rotation_risk'].mean() if not team_difficulty.empty else 0.1
+            
+            # Home vs away split
+            home_games = team_fixtures[team_fixtures['team_h'] == team_id]
+            away_games = team_fixtures[team_fixtures['team_a'] == team_id]
+            home_ratio = len(home_games) / max(len(team_fixtures), 1)
+            
+            # Next fixture info
+            next_fixture = team_fixtures.sort_values(['event', 'kickoff_time']).iloc[0]
+            next_venue = 'home' if next_fixture['team_h'] == team_id else 'away'
+            opponent_team = int(next_fixture['team_a'] if next_venue == 'home' else next_fixture['team_h'])
+            next_difficulty = next_fixture['team_h_difficulty'] if next_venue == 'home' else next_fixture['team_a_difficulty']
+            venue_multiplier = 1.1 if next_venue == 'home' else 0.9
+            
+            head_to_head = self._compute_head_to_head(fixtures_df, team_id, opponent_team)
             
             return {
                 'team_id': team_id,
@@ -262,8 +366,18 @@ class FixtureAnalyzer:
                 'has_double_gameweek': has_double_gw,
                 'rotation_risk': round(avg_rotation_risk, 2),
                 'fixture_count': len(team_fixtures),
-                'home_fixtures': len(team_fixtures[team_fixtures['team_h'] == team_id]),
-                'away_fixtures': len(team_fixtures[team_fixtures['team_a'] == team_id])
+                'home_fixtures': len(home_games),
+                'away_fixtures': len(away_games),
+                'home_ratio': round(home_ratio, 2),
+                'next_fixture': {
+                    'venue': next_venue,
+                    'difficulty': next_difficulty,
+                    'event': int(next_fixture['event']),
+                    'opponent_team': opponent_team,
+                    'fixture_id': int(next_fixture['id']),
+                    'venue_multiplier': venue_multiplier,
+                    'head_to_head': head_to_head
+                }
             }
             
         except Exception as e:

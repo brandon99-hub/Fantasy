@@ -122,6 +122,15 @@ cd frontend
 npm test
 ```
 
+### 📐 Model Training & Evaluation
+
+- Historical per-gameweek stats are persisted locally (run `POST /api/system/refresh-data` to pull data + histories).
+- Kick off end-to-end model training via `POST /api/system/train-models`. Minutes, points, and ensemble models now:
+  - Train on chronological datasets built from stored `player_history`.
+  - Use time-based validation/test splits to compute MAE / RMSE / R².
+  - Save artifacts under `backend/data/models/` and log metrics to the `model_metrics` table.
+- Query `/api/system/model-status` to inspect the latest metrics and confirm artifact freshness before optimizing teams.
+
 ## 🐳 Docker Deployment
 
 ```bash

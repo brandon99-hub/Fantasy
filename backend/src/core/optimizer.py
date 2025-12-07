@@ -1,3 +1,4 @@
+import math
 import pandas as pd
 import numpy as np
 from ortools.linear_solver import pywraplp
@@ -15,15 +16,43 @@ from backend.src.models.ensemble_predictor import EnsemblePredictor
 class FPLOptimizer:
     """Mathematical optimization for FPL team selection using OR-Tools"""
     
+    # Class-level model cache to avoid retraining on every request
+    _ensemble_predictor_cache = None
+    _fixture_analyzer_cache = None
+    _price_predictor_cache = None
+    _cache_lock = False  # Simple flag to prevent concurrent training
+    
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         self.rules = FPLRules()
-        self.fixture_analyzer = FixtureAnalyzer()
-        self.price_predictor = PricePredictor()
+        
+        # Use cached instances if available, otherwise create and cache
+        if FPLOptimizer._fixture_analyzer_cache is None:
+            self.logger.info("Initializing FixtureAnalyzer (first time)")
+            FPLOptimizer._fixture_analyzer_cache = FixtureAnalyzer()
+        else:
+            self.logger.info("Reusing cached FixtureAnalyzer")
+            
+        if FPLOptimizer._price_predictor_cache is None:
+            self.logger.info("Initializing PricePredictor (first time)")
+            FPLOptimizer._price_predictor_cache = PricePredictor()
+        else:
+            self.logger.info("Reusing cached PricePredictor")
+            
+        if FPLOptimizer._ensemble_predictor_cache is None:
+            self.logger.info("Initializing EnsemblePredictor (first time)")
+            FPLOptimizer._ensemble_predictor_cache = EnsemblePredictor()
+        else:
+            self.logger.info("Reusing cached EnsemblePredictor")
+            
+        self.fixture_analyzer = FPLOptimizer._fixture_analyzer_cache
+        self.price_predictor = FPLOptimizer._price_predictor_cache
+        self.ensemble_predictor = FPLOptimizer._ensemble_predictor_cache
+        
+        # These are lightweight, create new instances
         self.strategic_planner = StrategicPlanner()
         self.news_analyzer = NewsAnalyzer()
         self.eo_tracker = EffectiveOwnershipTracker()
-        self.ensemble_predictor = EnsemblePredictor()
         self.solver = None
         self.status = None
         self.position_map = {
@@ -43,6 +72,184 @@ class FPLOptimizer:
             'MID': 2,
             'FWD': 1
         }
+        self._primary_attack_threshold = {
+            'MID': {'ga_per90': 0.35, 'xgi_per90': 0.40},
+            'FWD': {'ga_per90': 0.35, 'xgi_per90': 0.40},
+        }
+
+    @staticmethod
+    def _safe_number(value, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return default
+            if isinstance(value, float) and math.isnan(value):
+                return default
+            return float(value)
+        except Exception:
+            return default
+
+    def _get_value(self, player_row, key: str, default: float = 0.0) -> float:
+        if isinstance(player_row, dict):
+            raw = player_row.get(key, default)
+        elif hasattr(player_row, "get"):
+            raw = player_row.get(key, default)
+        else:
+            raw = getattr(player_row, key, default)
+        return self._safe_number(raw, default)
+
+    def _minutes_floor(self, current_gw: int) -> float:
+        """Dynamic minutes floor so early-season players aren't unfairly filtered."""
+        return 180.0 if current_gw <= 6 else 300.0
+
+    def _player_usage_metrics(self, player_row, current_gw: int) -> Dict[str, float]:
+        start_prob = self._get_value(player_row, 'start_probability')
+        expected_minutes = self._get_value(player_row, 'expected_minutes')
+        season_minutes = self._get_value(player_row, 'minutes')
+        form = self._get_value(player_row, 'form')
+        last_two_override = expected_minutes >= 75.0 and start_prob >= 0.75
+        minutes_floor = self._minutes_floor(current_gw)
+        return {
+            'start_probability': start_prob,
+            'expected_minutes': expected_minutes,
+            'season_minutes': season_minutes,
+            'form': form,
+            'meets_minutes_floor': season_minutes >= minutes_floor or last_two_override
+        }
+
+    def _calculate_attacking_rates(self, player_row) -> Dict[str, float]:
+        minutes_played = max(self._get_value(player_row, 'minutes'), 1.0)
+        goals = self._get_value(player_row, 'goals_scored')
+        assists = self._get_value(player_row, 'assists')
+        xgi = self._get_value(player_row, 'expected_goal_involvements')
+        ga_per90 = ((goals + assists) / minutes_played) * 90.0
+        xgi_per90 = (xgi / minutes_played) * 90.0
+        assists_per90 = (assists / minutes_played) * 90.0
+        return {
+            'ga_per90': ga_per90,
+            'xgi_per90': xgi_per90,
+            'assists_per90': assists_per90
+        }
+
+    def _calculate_defensive_metrics(self, player_row) -> Dict[str, float]:
+        """Calculate defensive contribution metrics for CDMs and defenders."""
+        minutes_played = max(self._get_value(player_row, 'minutes'), 1.0)
+        tackles = self._get_value(player_row, 'tackles')
+        defensive_contrib = self._get_value(player_row, 'defensive_contribution')
+        clearances_blocks = self._get_value(player_row, 'clearances_blocks_interceptions')
+        bps = self._get_value(player_row, 'bps')
+        clean_sheets = self._get_value(player_row, 'clean_sheets')
+        
+        tackles_per90 = (tackles / minutes_played) * 90.0
+        def_contrib_per90 = (defensive_contrib / minutes_played) * 90.0
+        cbi_per90 = (clearances_blocks / minutes_played) * 90.0
+        bps_per90 = (bps / minutes_played) * 90.0
+        
+        return {
+            'tackles_per90': tackles_per90,
+            'defensive_contrib_per90': def_contrib_per90,
+            'cbi_per90': cbi_per90,
+            'bps_per90': bps_per90,
+            'clean_sheets': clean_sheets
+        }
+
+    def _passes_availability_filters(self, player_row, current_gw: int) -> bool:
+        usage = self._player_usage_metrics(player_row, current_gw)
+        if usage['start_probability'] < 0.60:
+            return False
+        if usage['expected_minutes'] < 60.0:
+            return False
+        if not usage['meets_minutes_floor']:
+            return False
+        return True
+
+    def _passes_role_filters(
+        self,
+        player_row,
+        ga_per90: float,
+        xgi_per90: float,
+        fixture_summary: Optional[Dict],
+        points_gain: float
+    ) -> bool:
+        """Position-specific filters based on how each role actually scores FPL points."""
+        if hasattr(player_row, 'get'):
+            pos_value = player_row.get('position')
+        else:
+            pos_value = player_row['position']
+        pos_code = self._normalize_position_code(pos_value)
+        
+        # Get additional metrics needed for position-specific checks
+        attacking_rates = self._calculate_attacking_rates(player_row)
+        defensive_metrics = self._calculate_defensive_metrics(player_row)
+        assists_per90 = attacking_rates['assists_per90']
+        start_prob = self._get_value(player_row, 'start_probability', 0.0)
+        fixture_difficulty = (fixture_summary or {}).get('avg_difficulty', 3.0)
+        implied_conceded = (fixture_summary or {}).get('implied_conceded', 1.6)
+        implied_goals = (fixture_summary or {}).get('implied_goals', 1.4)
+        
+        # FORWARDS: Primary focus on goals/assists
+        if pos_code == 'FWD':
+            if ga_per90 >= 0.25 or xgi_per90 >= 0.30:
+                return True
+            # Override: exceptional predicted gain + excellent fixture/start odds
+            if points_gain >= 3.0 and start_prob >= 0.70 and fixture_difficulty <= 2.5:
+                return True
+            return False
+        
+        # ATTACKING MIDFIELDERS: Goals, assists, or creative output
+        if pos_code == 'MID':
+            # Primary: G+A threshold
+            if ga_per90 >= 0.25 or xgi_per90 >= 0.30:
+                return True
+            # Creative midfielder: high assist rate even if low goals
+            if assists_per90 >= 0.20 and xgi_per90 >= 0.25:
+                return True
+            # Defensive midfielder path: check defensive contributions
+            tackles_per90 = defensive_metrics['tackles_per90']
+            def_contrib_per90 = defensive_metrics['defensive_contrib_per90']
+            bps_per90 = defensive_metrics['bps_per90']
+            # CDM/DM profile: strong defensive output + bonus potential
+            if (tackles_per90 >= 2.5 or def_contrib_per90 >= 3.0) and bps_per90 >= 15.0:
+                return True
+            # Override: exceptional predicted gain + excellent context
+            if points_gain >= 3.0 and start_prob >= 0.75 and fixture_difficulty <= 2.5:
+                return True
+            return False
+        
+        # DEFENDERS: Clean sheets, defensive contributions, or attacking threat (wing-backs)
+        if pos_code == 'DEF':
+            # Wing-back/full-back: attacking output acceptable
+            if ga_per90 >= 0.10:
+                return True
+            # Clean sheet probability (low implied conceded = high CS chance)
+            if implied_conceded <= 1.2:
+                return True
+            # Defensive contributions: tackles, clearances, blocks
+            tackles_per90 = defensive_metrics['tackles_per90']
+            cbi_per90 = defensive_metrics['cbi_per90']
+            def_contrib_per90 = defensive_metrics['defensive_contrib_per90']
+            if tackles_per90 >= 2.0 or cbi_per90 >= 4.0 or def_contrib_per90 >= 2.5:
+                return True
+            # Override: exceptional predicted gain + strong CS odds
+            if points_gain >= 2.5 and implied_conceded <= 1.4:
+                return True
+            return False
+        
+        # GOALKEEPERS: Saves and clean sheet potential
+        if pos_code == 'GKP':
+            saves_per90 = self._get_value(player_row, 'saves_per_90', 0.0)
+            # Strong CS odds (low implied conceded)
+            if implied_conceded <= 1.2:
+                return True
+            # High save rate (busy keeper = save points)
+            if saves_per90 >= 3.0:
+                return True
+            # Override: exceptional predicted gain + decent CS odds
+            if points_gain >= 2.5 and implied_conceded <= 1.4:
+                return True
+            return False
+        
+        # Fallback for any unhandled positions
+        return points_gain >= 1.0
 
     def _normalize_position_code(self, position: str) -> str:
         """Normalize position names to FPL codes"""
@@ -85,23 +292,27 @@ class FPLOptimizer:
                 self.logger.error(f"Missing required columns: {missing_cols}")
                 return {}
             
-            # Add predicted_points if missing (use form as fallback)
             if 'predicted_points' not in players_df.columns:
-                if 'form' in players_df.columns:
-                    players_df['predicted_points'] = players_df['form'].fillna(0)
-                    self.logger.info("Using 'form' as predicted_points fallback")
-                else:
-                    players_df['predicted_points'] = 0
-                    self.logger.warning("No predicted_points or form data available, using 0")
+                raise ValueError("Predicted points are required before optimization. Run the prediction pipeline first.")
+            if players_df['predicted_points'].isna().all():
+                raise ValueError("Predicted points column is empty. Please generate predictions before optimizing.")
             
             # Prepare data
             players = players_df.copy()
             players['price'] = players['now_cost'] / 10.0  # Convert to millions
             players['points'] = players['predicted_points'].fillna(0)
             
-            # Filter out unavailable players
+            # Filter out unavailable players, but always keep the manager's current squad
             if 'status' in players.columns:
-                players = players[players['status'] == 'a']
+                active_players = players[players['status'] == 'a']
+                if current_team:
+                    current_players = players[players['id'].isin(current_team)]
+                    if not current_players.empty:
+                        players = pd.concat([active_players, current_players]).drop_duplicates(subset='id')
+                    else:
+                        players = active_players
+                else:
+                    players = active_players
             
             n_players = len(players)
             if n_players < 15:
@@ -500,7 +711,8 @@ class FPLOptimizer:
     
     def _analyze_bench_strength(self, team_ids: List[int], players_df: pd.DataFrame,
                                 include_fixture_analysis: bool, fixture_analysis: Dict,
-                                starting_ids: Optional[List[int]] = None) -> Dict:
+                                starting_ids: Optional[List[int]] = None,
+                                current_gw: int = 1) -> Dict:
         """Analyze bench strength and autosub potential"""
         try:
             team_df = players_df[players_df['id'].isin(team_ids)]
@@ -522,6 +734,10 @@ class FPLOptimizer:
                 starting_ids = starting_df['id'].tolist()
             
             bench = team_df[~team_df['id'].isin(starting_ids)]
+            if not bench.empty:
+                bench = bench[
+                    bench.apply(lambda row: self._passes_availability_filters(row, current_gw), axis=1)
+                ]
             
             # Calculate bench strength (0-10 scale)
             bench_avg_points = bench['predicted_points'].mean() if not bench.empty else 0.0
@@ -662,6 +878,37 @@ class FPLOptimizer:
                 'recommendations': []
             }
     
+    def _apply_odds_boost(self, players_df: pd.DataFrame, fixture_analysis: Dict) -> pd.DataFrame:
+        """Scale predicted points using bookmaker implied goals."""
+        try:
+            if players_df.empty or not fixture_analysis:
+                return players_df
+            summaries = fixture_analysis.get('team_summaries') or {}
+            implied_values = [
+                summary.get('implied_goals')
+                for summary in summaries.values()
+                if summary.get('implied_goals')
+            ]
+            if not implied_values:
+                return players_df
+            league_avg = sum(implied_values) / len(implied_values)
+            if league_avg <= 0:
+                return players_df
+            multipliers = {}
+            for team_id, summary in summaries.items():
+                implied = summary.get('implied_goals')
+                if implied:
+                    multipliers[int(team_id)] = max(0.7, min(1.4, implied / league_avg))
+            if not multipliers or 'team' not in players_df.columns:
+                return players_df
+            players_df = players_df.copy()
+            players_df['odds_multiplier'] = players_df['team'].map(multipliers).fillna(1.0)
+            players_df['predicted_points'] = players_df['predicted_points'] * players_df['odds_multiplier']
+            return players_df
+        except Exception as e:
+            self.logger.error(f"Error applying odds boost: {str(e)}")
+            return players_df
+    
     def _generate_chip_recommendations(self, team_ids: List[int], players_df: pd.DataFrame,
                                       bench_analysis: Dict, fixture_analysis: Dict,
                                       captain_suggestions: List[Dict], free_transfers: int,
@@ -677,6 +924,21 @@ class FPLOptimizer:
             
             if team_df.empty:
                 return recommendations
+            
+            fixture_summaries = fixture_analysis.get('team_summaries') if fixture_analysis else {}
+            if not fixture_summaries:
+                recommendations.append({
+                    'chip': 'Fixture Data',
+                    'score': 1.0,
+                    'reason': 'Fixture difficulty data unavailable. Refresh fixtures before making chip decisions.',
+                    'recommended_gameweek': 'N/A',
+                    'confidence': 'Low',
+                    'priority': 5,
+                    'conditions': [
+                        'Upcoming fixture data missing',
+                        'Run data refresh to enable accurate chip timing'
+                    ]
+                })
             
             # 1. Bench Boost Analysis
             bench_strength = bench_analysis.get('bench_strength', 0)
@@ -1007,9 +1269,54 @@ class FPLOptimizer:
                 pid for pid in starting_ids_for_analysis if pid in available_player_ids
             ]
             
-            # Ensure predicted_points column exists before using it
+            # Generate predictions FIRST before any code that needs them
             if 'predicted_points' not in players_df.columns:
-                players_df['predicted_points'] = players_df.get('form', 0)
+                self.logger.info("Generating predictions before optimization...")
+                try:
+                    # Train ensemble predictor if not already trained
+                    if not self.ensemble_predictor.is_fitted:
+                        self.logger.info("Training ensemble predictor...")
+                        self.ensemble_predictor.train()
+                    
+                    # Use ensemble predictor if available
+                    if self.ensemble_predictor.is_fitted:
+                        # Get minutes predictions
+                        from backend.src.models.minutes_model import MinutesPredictor
+                        minutes_model = MinutesPredictor()
+                        if not minutes_model.is_trained():
+                            minutes_model.train()
+                        
+                        minutes_predictions = minutes_model.predict_minutes(players_df)
+                        
+                        # Get ensemble predictions (without fixture analysis for now)
+                        enhanced_predictions = self.ensemble_predictor.predict_points(
+                            players_df, minutes_predictions, None
+                        )
+                        
+                        if not enhanced_predictions.empty and 'predicted_points' in enhanced_predictions.columns:
+                            # Merge predictions into players_df
+                            merge_cols = ['id', 'predicted_points']
+                            if 'id' in players_df.columns:
+                                players_df = players_df.merge(
+                                    enhanced_predictions[merge_cols],
+                                    on='id', how='left', suffixes=('', '_enhanced')
+                                )
+                                if 'predicted_points_enhanced' in players_df.columns:
+                                    players_df['predicted_points'] = players_df['predicted_points_enhanced'].fillna(players_df['predicted_points'])
+                                    players_df.drop('predicted_points_enhanced', axis=1, inplace=True)
+                            else:
+                                raise ValueError("players_df missing 'id' column required for predictions merge")
+                        else:
+                            raise ValueError("Failed to generate predictions")
+                    else:
+                        raise ValueError("Ensemble predictor not fitted and could not be trained")
+                except Exception as e:
+                    self.logger.error(f"Error generating initial predictions: {str(e)}")
+                    raise ValueError(f"Failed to generate predictions: {str(e)}")
+            
+            # Ensure predicted_points column exists after generation
+            if 'predicted_points' not in players_df.columns:
+                raise ValueError("predicted_points missing from players_df after generation attempt.")
             
             # Ensure we have at least 11 players in the lineup when possible
             if current_team:
@@ -1061,10 +1368,39 @@ class FPLOptimizer:
                         'double_gameweeks': self.fixture_analyzer.detect_double_gameweeks(fixtures_df),
                         'blank_gameweeks': self.fixture_analyzer.detect_blank_gameweeks(fixtures_df)
                     }
+                    result['fixture_analysis']['status'] = 'ok'
                     
                 except Exception as e:
                     self.logger.error(f"Error in fixture analysis: {str(e)}")
                     result['errors'].append(f"Fixture analysis failed: {str(e)}")
+                    result['fixture_analysis'] = {'team_summaries': {}, 'status': 'unavailable'}
+            else:
+                result['fixture_analysis'] = {'team_summaries': {}, 'status': 'unavailable'}
+            
+            fixture_odds_map = db.get_fixture_odds_map()
+            team_summaries = result.get('fixture_analysis', {}).get('team_summaries', {})
+            if team_summaries and fixture_odds_map:
+                for team_id, summary in team_summaries.items():
+                    next_fixture = summary.get('next_fixture') or {}
+                    fixture_id = next_fixture.get('fixture_id')
+                    if not fixture_id:
+                        continue
+                    odds_row = fixture_odds_map.get(int(fixture_id))
+                    if not odds_row:
+                        continue
+                    venue = next_fixture.get('venue', 'home')
+                    if venue == 'home':
+                        implied_for = odds_row.get('home_implied_goals')
+                        implied_against = odds_row.get('away_implied_goals')
+                    else:
+                        implied_for = odds_row.get('away_implied_goals')
+                        implied_against = odds_row.get('home_implied_goals')
+                    summary['implied_goals'] = implied_for
+                    summary['implied_conceded'] = implied_against
+                    next_fixture['implied_goals'] = implied_for
+                    next_fixture['implied_conceded'] = implied_against
+                    if odds_row.get('bookmaker'):
+                        summary['bookmaker'] = odds_row['bookmaker']
             
             # 2. Price Analysis
             if include_price_analysis:
@@ -1114,98 +1450,80 @@ class FPLOptimizer:
                     self.logger.error(f"Error in strategic planning: {str(e)}")
                     result['errors'].append(f"Strategic planning failed: {str(e)}")
             
-            # 4. Enhanced Points Prediction
+            # 4. Enhanced Points Prediction (with fixture analysis)
             try:
-                self.logger.info("Generating enhanced points predictions...")
+                self.logger.info("Enhancing predictions with fixture analysis...")
                 
-                # Train ensemble predictor if not already trained
-                if not self.ensemble_predictor.is_fitted:
-                    self.logger.info("Training ensemble predictor...")
-                    self.ensemble_predictor.train()
-                
-                # Use ensemble predictor if available
-                if self.ensemble_predictor.is_fitted:
-                    # Get minutes predictions
-                    from backend.src.models.minutes_model import MinutesPredictor
-                    minutes_model = MinutesPredictor()
-                    if not minutes_model.is_trained():
-                        minutes_model.train()
-                    
-                    minutes_predictions = minutes_model.predict_minutes(players_df)
-                    
+                # Only enhance if we have fixture analysis and predictions already exist
+                if include_fixture_analysis and 'team_summaries' in result.get('fixture_analysis', {}) and 'predicted_points' in players_df.columns:
                     # Get fixture analysis for players
-                    fixture_analysis_df = None
-                    if include_fixture_analysis and 'team_summaries' in result['fixture_analysis']:
-                        team_summaries = result['fixture_analysis']['team_summaries']
-                        fixture_data = []
-                        for team_id, summary in team_summaries.items():
-                            fixture_data.append({
-                                'team_id': team_id,
-                                'avg_difficulty': summary.get('avg_difficulty', 3.0),
-                                'has_double_gameweek': summary.get('has_double_gameweek', False),
-                                'rotation_risk': summary.get('rotation_risk', 0.1)
-                            })
-                        fixture_analysis_df = pd.DataFrame(fixture_data)
+                    team_summaries = result['fixture_analysis']['team_summaries']
+                    fixture_data = []
+                    for team_id, summary in team_summaries.items():
+                        fixture_data.append({
+                            'team_id': team_id,
+                            'avg_difficulty': summary.get('avg_difficulty', 3.0),
+                            'has_double_gameweek': summary.get('has_double_gameweek', False),
+                            'rotation_risk': summary.get('rotation_risk', 0.1)
+                        })
+                    fixture_analysis_df = pd.DataFrame(fixture_data)
                     
-                    # Get ensemble predictions
-                    enhanced_predictions = self.ensemble_predictor.predict_points(
-                        players_df, minutes_predictions, fixture_analysis_df
-                    )
-                    
-                    self.logger.info(f"Enhanced predictions shape: {enhanced_predictions.shape if not enhanced_predictions.empty else 'Empty'}")
-                    if not enhanced_predictions.empty:
-                        self.logger.info(f"Enhanced predictions columns: {list(enhanced_predictions.columns)}")
-                        # Check if required columns exist
-                        required_cols = ['id', 'predicted_points', 'uncertainty', 'risk_category']
-                        available_cols = [col for col in required_cols if col in enhanced_predictions.columns]
+                    if not fixture_analysis_df.empty and self.ensemble_predictor.is_fitted:
+                        # Get minutes predictions
+                        from backend.src.models.minutes_model import MinutesPredictor
+                        minutes_model = MinutesPredictor()
+                        if not minutes_model.is_trained():
+                            minutes_model.train()
                         
-                        if 'predicted_points' in available_cols:
-                            # Use enhanced predictions for optimization
-                            merge_cols = ['id'] + [col for col in available_cols if col != 'id']
-                            self.logger.info(f"Merging columns: {merge_cols}")
+                        minutes_predictions = minutes_model.predict_minutes(players_df)
+                        
+                        # Get enhanced ensemble predictions with fixture analysis
+                        enhanced_predictions = self.ensemble_predictor.predict_points(
+                            players_df, minutes_predictions, fixture_analysis_df
+                        )
+                        
+                        self.logger.info(f"Enhanced predictions shape: {enhanced_predictions.shape if not enhanced_predictions.empty else 'Empty'}")
+                        if not enhanced_predictions.empty:
+                            self.logger.info(f"Enhanced predictions columns: {list(enhanced_predictions.columns)}")
+                            # Check if required columns exist
+                            required_cols = ['id', 'predicted_points', 'uncertainty', 'risk_category']
+                            available_cols = [col for col in required_cols if col in enhanced_predictions.columns]
                             
-                            # Check if players_df has 'id' column
-                            if 'id' not in players_df.columns:
-                                self.logger.error("players_df missing 'id' column")
-                                players_df['predicted_points'] = players_df.get('form', 0)
-                                players_df['uncertainty'] = 2.0
-                                players_df['risk_category'] = 'Medium Risk'
-                            else:
+                            if 'predicted_points' in available_cols:
+                                # Use enhanced predictions for optimization
+                                merge_cols = ['id'] + [col for col in available_cols if col != 'id']
+                                self.logger.info(f"Merging columns: {merge_cols}")
+                                
+                                # Check if players_df has 'id' column
+                                if 'id' not in players_df.columns:
+                                    raise ValueError("players_df missing 'id' column required for predictions merge")
                                 try:
                                     players_df = players_df.merge(
                                         enhanced_predictions[merge_cols],
                                         on='id', how='left', suffixes=('', '_enhanced')
                                     )
-                                    # Check if predicted_points column exists after merge
-                                    if 'predicted_points' in players_df.columns:
-                                        players_df['predicted_points'] = players_df['predicted_points'].fillna(players_df.get('form', 0))
-                                    elif 'predicted_points_enhanced' in players_df.columns:
-                                        players_df['predicted_points'] = players_df['predicted_points_enhanced'].fillna(players_df.get('form', 0))
+                                    if 'predicted_points_enhanced' in players_df.columns:
+                                        # Update with enhanced predictions where available
+                                        players_df['predicted_points'] = players_df['predicted_points_enhanced'].fillna(players_df['predicted_points'])
                                         players_df.drop('predicted_points_enhanced', axis=1, inplace=True)
-                                    else:
-                                        self.logger.error("predicted_points column missing after merge")
-                                        players_df['predicted_points'] = players_df.get('form', 0)
+                                    elif 'predicted_points' not in players_df.columns:
+                                        raise ValueError("predicted_points column missing after merge")
                                 except Exception as merge_error:
-                                    self.logger.error(f"Merge error: {str(merge_error)}")
-                                    players_df['predicted_points'] = players_df.get('form', 0)
-                                    players_df['uncertainty'] = 2.0
-                                    players_df['risk_category'] = 'Medium Risk'
+                                    self.logger.warning(f"Failed to merge enhanced predictions: {merge_error}, using existing predictions")
+                            else:
+                                self.logger.warning("Enhanced predictions missing required columns, using existing predictions")
                         else:
-                            self.logger.warning("Enhanced predictions missing required columns, using fallback")
-                            players_df['predicted_points'] = players_df.get('form', 0)
-                            players_df['uncertainty'] = 2.0
-                            players_df['risk_category'] = 'Medium Risk'
-                
+                            self.logger.warning("Enhanced predictions empty, using existing predictions")
                 else:
-                    # Fallback to basic form-based predictions
-                    players_df['predicted_points'] = players_df.get('form', 0)
-                    players_df['uncertainty'] = 2.0
-                    players_df['risk_category'] = 'Medium Risk'
+                    self.logger.info("Skipping prediction enhancement (no fixture analysis or predictions already exist)")
                 
             except Exception as e:
-                self.logger.error(f"Error in enhanced predictions: {str(e)}")
-                result['warnings'].append(f"Using fallback predictions: {str(e)}")
-                players_df['predicted_points'] = players_df.get('form', 0)
+                self.logger.warning(f"Error enhancing predictions with fixture analysis: {str(e)}")
+                # Don't raise - we already have predictions from earlier, enhancement is optional
+                if 'predicted_points' not in players_df.columns:
+                    raise ValueError(f"Failed to generate predictions: {str(e)}")
+            
+            players_df = self._apply_odds_boost(players_df, result.get('fixture_analysis', {}))
             
             # 5. Core Team Optimization
             try:
@@ -1244,6 +1562,15 @@ class FPLOptimizer:
                         # Get captain suggestions for current team
                         current_team_df = players_df[players_df['id'].isin(team_for_captain)]
                         
+                        implied_values = []
+                        if include_fixture_analysis and 'team_summaries' in result['fixture_analysis']:
+                            implied_values = [
+                                summary.get('implied_goals')
+                                for summary in result['fixture_analysis']['team_summaries'].values()
+                                if summary.get('implied_goals')
+                            ]
+                        league_implied_avg = sum(implied_values) / len(implied_values) if implied_values else 1.4
+                        
                         # Calculate captain scores for each player
                         if 'predicted_points' in current_team_df.columns:
                             captain_scores = []
@@ -1258,6 +1585,8 @@ class FPLOptimizer:
                                 if include_fixture_analysis and 'team_summaries' in result['fixture_analysis']:
                                     team_summary = result['fixture_analysis']['team_summaries'].get(player['team'], {})
                                     difficulty = team_summary.get('avg_difficulty', 3.0)
+                                    implied_text = ""
+                                    implied_goals = team_summary.get('implied_goals')
                                     
                                     # Convert difficulty to score (easier = higher score)
                                     # Difficulty 1-2: Excellent (1.5x)
@@ -1285,6 +1614,12 @@ class FPLOptimizer:
                                         fixture_text += ", DGW"
                                 else:
                                     fixture_score = player.get('predicted_points', 0) * 0.25
+                                    implied_text = ""
+                                    implied_goals = None
+                                
+                                if implied_goals:
+                                    fixture_score += implied_goals * 0.3
+                                    implied_text = f"Implied goals {implied_goals:.1f}"
                                 
                                 # Form trend (15% weight)
                                 form = player.get('form', 0)
@@ -1324,6 +1659,8 @@ class FPLOptimizer:
                                 reason_parts.append(f"Predicted {player['predicted_points']:.1f} points")
                                 if fixture_text:
                                     reason_parts.append(fixture_text)
+                                if implied_text:
+                                    reason_parts.append(implied_text)
                                 if form_text:
                                     reason_parts.append(form_text)
                                 if ownership_text and ownership < 10:
@@ -1349,7 +1686,11 @@ class FPLOptimizer:
                                         'position': player['position'],
                                         'expected_points': round(player['predicted_points'], 1)
                                     },
-                                    'expected_points': round(player['predicted_points'] * 2, 1),  # Double for captain
+                                    'expected_points': round(
+                                        player['predicted_points'] * 2 * (
+                                            max(0.9, min(1.5, (team_summary.get('implied_goals', league_implied_avg) or league_implied_avg) / league_implied_avg))
+                                        ), 1
+                                    ),
                                     'reason': item['reason'],
                                     'confidence': item['confidence'],
                                     'captain_score': round(item['score'], 1)
@@ -1385,12 +1726,40 @@ class FPLOptimizer:
                             code = self._normalize_position_code(starter['position'])
                             start_pos_counts[code] = start_pos_counts.get(code, 0) + 1
                         all_predictions = players_df[~players_df['id'].isin(team_for_transfers)]
+                        team_summaries = result.get('fixture_analysis', {}).get('team_summaries', {})
                         
-                        # Convert budget to 0.1M units (£0.1m = 1 unit)
-                        remaining_budget_units = budget * 10
+                        # Enrich with manager ownership data (top manager insights)
+                        try:
+                            self.logger.info("Enriching transfer candidates with manager ownership data...")
+                            eo_data = self.eo_tracker.calculate_effective_ownership(all_predictions)
+                            if not eo_data.empty:
+                                all_predictions = all_predictions.merge(
+                                    eo_data[['id', 'effective_ownership', 'template_status', 'differential_value']],
+                                    on='id',
+                                    how='left'
+                                )
+                                # Also enrich current team for comparison
+                                current_team_df = current_team_df.merge(
+                                    eo_data[['id', 'effective_ownership', 'template_status', 'differential_value']],
+                                    on='id',
+                                    how='left'
+                                )
+                                self.logger.info(f"Enriched {len(all_predictions)} players with manager ownership data")
+                            else:
+                                self.logger.warning("Manager ownership data unavailable, using basic ownership")
+                                all_predictions['effective_ownership'] = all_predictions.get('selected_by_percent', 0)
+                                all_predictions['template_status'] = 'unknown'
+                                all_predictions['differential_value'] = 100 - all_predictions.get('selected_by_percent', 0)
+                        except Exception as e:
+                            self.logger.warning(f"Could not enrich with manager data: {e}")
+                            all_predictions['effective_ownership'] = all_predictions.get('selected_by_percent', 0)
+                            all_predictions['template_status'] = 'unknown'
+                            all_predictions['differential_value'] = 100 - all_predictions.get('selected_by_percent', 0)
+                        
+                        # Convert available bank to 0.1M units (£0.1m = 1 unit)
+                        bank_units = max(int(round((bank_amount or 0.0) * 10)), 0)
                         
                         transfer_suggestions = []
-                        
                         recommended_in_ids = set()
                         premium_price_threshold = 100  # £10.0m
                         premium_points_threshold = 200
@@ -1398,11 +1767,13 @@ class FPLOptimizer:
                         premium_ids.update(current_team_df[current_team_df.get('total_points', 0) >= premium_points_threshold]['id'].tolist())
                         captain_candidate_ids = set(starting_ids_for_analysis[:3])
                         
+                        fallback_candidates = []
+                        
                         for _, current_player in current_team_df.iterrows():
-                            # Calculate available funds = remaining budget + player's selling price
-                            available_funds = remaining_budget_units + current_player['now_cost']
+                            # Calculate available funds = bank + player's selling price
+                            available_funds = bank_units + current_player['now_cost']
                             
-                            self.logger.info(f"Transfer out {current_player['web_name']}: Available funds = £{available_funds/10:.1f}m (£{remaining_budget_units/10:.1f}m bank + £{current_player['now_cost']/10:.1f}m from sale)")
+                            self.logger.info(f"Transfer out {current_player['web_name']}: Available funds = £{available_funds/10:.1f}m (£{bank_units/10:.1f}m bank + £{current_player['now_cost']/10:.1f}m from sale)")
                             
                             # Find better alternatives within budget
                             position_alternatives = all_predictions[
@@ -1411,31 +1782,118 @@ class FPLOptimizer:
                                 (all_predictions['predicted_points'] > current_player['predicted_points'])
                             ].nlargest(5, 'predicted_points')  # Get top 5 to find best option
                             
-                            # Only take the BEST alternative (highest points gain) for this player
+                            # Only take the BEST alternative that passes availability filters
                             if not position_alternatives.empty:
-                                alternative = position_alternatives.iloc[0]
+                                alternative = None
+                                alternative_usage = {}
+                                for _, candidate in position_alternatives.iterrows():
+                                    if not self._passes_availability_filters(candidate, current_gw):
+                                        continue
+                                    usage = self._player_usage_metrics(candidate, current_gw)
+                                    alternative = candidate
+                                    alternative_usage = usage
+                                    break
+                                
+                                if alternative is None:
+                                    continue
                                 
                                 if int(alternative['id']) in recommended_in_ids:
                                     continue
-                                points_gain = alternative['predicted_points'] - current_player['predicted_points']
+                                
+                                current_usage = self._player_usage_metrics(current_player, current_gw)
+                                current_start_prob = current_usage['start_probability'] or 1.0
+                                current_effective = current_player['predicted_points'] * current_start_prob
+                                alternative_start_prob = alternative_usage.get('start_probability', 0.0)
+                                alternative_minutes = alternative_usage.get('expected_minutes', 0.0)
+                                alternative_rates = self._calculate_attacking_rates(alternative)
+                                alternative_defensive = self._calculate_defensive_metrics(alternative)
+                                
+                                alt_effective = alternative['predicted_points'] * alternative_start_prob
                                 
                                 is_premium = int(current_player['id']) in premium_ids
                                 is_captain_candidate = int(current_player['id']) in captain_candidate_ids
-                                min_gain_required = 0.5
-                                if is_premium or is_captain_candidate:
-                                    min_gain_required = 3.0
+                                
+                                # Configurable strictness for transfer suggestions
+                                # Get strictness from preferences or use default
+                                transfer_strictness = preferences.transfer_strictness if (preferences and hasattr(preferences, 'transfer_strictness')) else 'balanced'
+                                
+                                # Set threshold based on strictness mode
+                                if transfer_strictness == 'strict':
+                                    min_gain_required = 0.2
+                                    if is_premium or is_captain_candidate:
+                                        min_gain_required = 1.5  # Original strict threshold
+                                elif transfer_strictness == 'relaxed':
+                                    min_gain_required = 0.1
+                                    if is_premium or is_captain_candidate:
+                                        min_gain_required = 0.2  # Very relaxed
+                                else:  # 'balanced' (default)
+                                    min_gain_required = 0.2
+                                    if is_premium or is_captain_candidate:
+                                        min_gain_required = 0.5  # Balanced threshold
+                                
+                                # Factor in venue advantage for the incoming player
+                                venue_multiplier = 1.0
+                                venue_context = ""
+                                alt_team_summary = team_summaries.get(alternative['team'], {}) if team_summaries else {}
+                                alt_next = alt_team_summary.get('next_fixture', {}) if alt_team_summary else {}
+                                venue_multiplier = alt_next.get('venue_multiplier', 1.0)
+                                venue = alt_next.get('venue')
+                                head_to_head = alt_next.get('head_to_head', {})
+                                if venue:
+                                    h2h_desc = ""
+                                    if head_to_head and head_to_head.get('samples'):
+                                        home_wins = head_to_head.get('home_wins', 0)
+                                        away_wins = head_to_head.get('away_wins', 0)
+                                        draws = head_to_head.get('draws', 0)
+                                        h2h_desc = f" | H2H last {head_to_head['samples']}: {home_wins}-{draws}-{away_wins}"
+                                    venue_context = f"{alternative.get('team_name', '')} play {venue} next (difficulty {alt_next.get('difficulty', 'N/A')}){h2h_desc}"
+                                alt_effective *= venue_multiplier
+
+                                # Risk-adjusted scores
+                                risk_penalty = 0.6
+                                alt_uncertainty = float(alternative.get('uncertainty', 2.0) or 2.0)
+                                current_uncertainty = float(current_player.get('uncertainty', 2.0) or 2.0)
+                                risk_adjusted_alt = alt_effective - risk_penalty * alt_uncertainty
+                                risk_adjusted_current = current_effective - risk_penalty * current_uncertainty
+
+                                # Fixture & head-to-head bonuses
+                                fixture_bonus = 0.0
+                                h2h_bonus = 0.0
+                                current_summary = team_summaries.get(current_player['team'], {}) if team_summaries else {}
+                                current_difficulty = current_summary.get('avg_difficulty', 3.0)
+                                alt_difficulty = alt_team_summary.get('avg_difficulty', 3.0) if alt_team_summary else 3.0
+                                fixture_bonus = (current_difficulty - alt_difficulty) * 0.4
+                                trend = (head_to_head.get('trend') or "").lower()
+                                if trend == 'home edge':
+                                    h2h_bonus = 0.3
+                                elif trend == 'away edge':
+                                    h2h_bonus = 0.15
+
+                                points_gain = (risk_adjusted_alt - risk_adjusted_current) + fixture_bonus + h2h_bonus
+                                
+                                if not self._passes_role_filters(
+                                    alternative,
+                                    alternative_rates['ga_per90'],
+                                    alternative_rates['xgi_per90'],
+                                    alt_team_summary,
+                                    points_gain
+                                ):
+                                    continue
                                 
                                 if points_gain > min_gain_required:  # Meaningful improvement
                                     cost_change = (alternative['now_cost'] - current_player['now_cost']) / 10
                                     
                                     # Check if transfer requires using bank funds
                                     uses_bank_funds = alternative['now_cost'] > current_player['now_cost']
-                                    bank_required = max(0, (alternative['now_cost'] - current_player['now_cost']) / 10)
-                                    new_bank_balance = (remaining_budget_units + current_player['now_cost'] - alternative['now_cost']) / 10
-                                    
-                                    # Skip if not affordable
-                                    if uses_bank_funds and bank_required > remaining_budget_units / 10:
+                                    required_units = max(0, alternative['now_cost'] - current_player['now_cost'])
+                                    if uses_bank_funds and required_units > bank_units:
                                         continue
+                                    bank_required = required_units / 10
+                                    if uses_bank_funds:
+                                        new_bank_balance = (bank_units - required_units) / 10
+                                    else:
+                                        refund_units = max(0, current_player['now_cost'] - alternative['now_cost'])
+                                        new_bank_balance = (bank_units + refund_units) / 10
                                     
                                     # Add fixture analysis
                                     fixture_advantage = ""
@@ -1447,7 +1905,7 @@ class FPLOptimizer:
                                         alternative_difficulty = alternative_team_summary.get('avg_difficulty', 3.0)
                                         
                                         if alternative_difficulty < current_difficulty - 0.5:
-                                            fixture_advantage = f". Easier fixtures: {alternative_difficulty:.1f} vs {current_difficulty:.1f}"
+                                            fixture_advantage = f"Easier fixtures: {alternative_difficulty:.1f} vs {current_difficulty:.1f}"
                                     
                                     # Add price analysis
                                     price_advantage = ""
@@ -1457,16 +1915,16 @@ class FPLOptimizer:
                                         alternative_price_pred = next((p for p in price_predictions if p['id'] == alternative['id']), {})
                                         
                                         if alternative_price_pred.get('price_rise_probability', 0) > 0.7:
-                                            price_advantage = ". Price likely to rise"
+                                            price_advantage = "Price likely to rise"
                                         elif current_price_pred.get('price_fall_probability', 0) > 0.7:
-                                            price_advantage = ". Current player price likely to fall"
+                                            price_advantage = "Current player price likely to fall"
                                     
                                     # Budget context
                                     budget_context = ""
                                     if uses_bank_funds:
-                                            budget_context = f". Uses £{bank_required:.1f}m from bank (£{new_bank_balance:.1f}m remaining)"
+                                        budget_context = f"Uses £{bank_required:.1f}m from bank (£{new_bank_balance:.1f}m remaining)"
                                     elif cost_change < 0:
-                                        budget_context = f". Frees £{abs(cost_change):.1f}m (£{new_bank_balance:.1f}m in bank)"
+                                        budget_context = f"Frees £{abs(cost_change):.1f}m (£{new_bank_balance:.1f}m in bank)"
                                     
                                     # Determine if player should be in starting XI or bench
                                     is_current_starter = current_player['id'] in current_starting_ids
@@ -1493,7 +1951,66 @@ class FPLOptimizer:
                                     else:
                                         bench_guidance = "Bench player - Squad depth"
                                     
-                                    transfer_suggestions.append({
+                                    pos_code = self._normalize_position_code(alternative.get('position', ''))
+                                    reason_parts = [
+                                        f"{alternative['web_name']} projected {alternative['predicted_points']:.1f} pts with {alternative_start_prob*100:.0f}% start odds (vs {current_player['web_name']} {current_player['predicted_points']:.1f} pts / {current_start_prob*100:.0f}%)",
+                                        f"Risk-adjusted delta +{(risk_adjusted_alt - risk_adjusted_current):.1f}"
+                                    ]
+                                    # Position-specific metric highlights
+                                    if pos_code == 'FWD':
+                                        reason_parts.append(
+                                            f"Attacking output: G+A {alternative_rates['ga_per90']:.2f}/90, xGI {alternative_rates['xgi_per90']:.2f}/90"
+                                        )
+                                    elif pos_code == 'MID':
+                                        if alternative_rates['ga_per90'] >= 0.35:
+                                            reason_parts.append(
+                                                f"Attacking: G+A {alternative_rates['ga_per90']:.2f}/90, Assists {alternative_rates['assists_per90']:.2f}/90"
+                                            )
+                                        elif alternative_defensive['tackles_per90'] >= 2.5:
+                                            reason_parts.append(
+                                                f"Defensive: {alternative_defensive['tackles_per90']:.1f} tackles/90, {alternative_defensive['defensive_contrib_per90']:.1f} def contrib/90, BPS {alternative_defensive['bps_per90']:.1f}/90"
+                                            )
+                                        else:
+                                            reason_parts.append(
+                                                f"Creative: Assists {alternative_rates['assists_per90']:.2f}/90, xGI {alternative_rates['xgi_per90']:.2f}/90"
+                                            )
+                                    elif pos_code == 'DEF':
+                                        if alternative_rates['ga_per90'] >= 0.15:
+                                            reason_parts.append(
+                                                f"Attacking defender: G+A {alternative_rates['ga_per90']:.2f}/90"
+                                            )
+                                        else:
+                                            reason_parts.append(
+                                                f"Defensive: {alternative_defensive['tackles_per90']:.1f} tackles/90, {alternative_defensive['cbi_per90']:.1f} CBI/90"
+                                            )
+                                    elif pos_code == 'GKP':
+                                        saves_per90 = self._get_value(alternative, 'saves_per_90', 0.0)
+                                        reason_parts.append(
+                                            f"Goalkeeper: {saves_per90:.1f} saves/90, CS odds from fixture analysis"
+                                        )
+                                    else:
+                                        reason_parts.append(
+                                            f"Per-90 impact: G+A {alternative_rates['ga_per90']:.2f}, xGI {alternative_rates['xgi_per90']:.2f}"
+                                        )
+                                    if alternative_minutes:
+                                        reason_parts.append(f"Expected minutes ≈{int(alternative_minutes)}")
+                                    if fixture_advantage:
+                                        reason_parts.append(fixture_advantage)
+                                    if venue_context:
+                                        reason_parts.append(venue_context)
+                                    implied_goals = alternative_team_summary.get('implied_goals')
+                                    if implied_goals:
+                                        reason_parts.append(f"Bookmakers expect {implied_goals:.1f} {alternative.get('team_name', '')} goals")
+                                    fixture_delta_value = None
+                                    if current_summary and alt_team_summary:
+                                        fixture_delta_value = current_difficulty - alt_difficulty
+
+                                    if price_advantage:
+                                        reason_parts.append(price_advantage)
+                                    if budget_context:
+                                        reason_parts.append(budget_context)
+                                    
+                                    transfer_dict = {
                                         'player_out': {
                                             'id': int(current_player['id']),
                                             'name': current_player['web_name'],
@@ -1526,14 +2043,75 @@ class FPLOptimizer:
                                         },
                                         'points_gain': round(points_gain, 1),
                                         'cost_change': round(cost_change, 1),
-                                        'reason': f"AI predicts {alternative['predicted_points']:.1f} vs {current_player['predicted_points']:.1f} points{fixture_advantage}{price_advantage}{budget_context}",
+                                        'reason': " ".join(reason_parts),
                                         'priority': 'High' if points_gain > 2 else 'Medium',
                                         'confidence': 'High' if alternative.get('uncertainty', 2.0) < 1.5 else 'Medium',
                                         'bank_remaining': round(new_bank_balance, 1),
                                         'uses_bank_funds': uses_bank_funds,
                                         'bench_guidance': bench_guidance,
-                                        'should_start': would_be_starter
-                                    })
+                                        'should_start': would_be_starter,
+                                        'metrics': {
+                                            'start_probability': round(alternative_start_prob, 2),
+                                            'expected_minutes': round(alternative_minutes, 1),
+                                            'ga_per90': round(alternative_rates['ga_per90'], 2),
+                                            'xgi_per90': round(alternative_rates['xgi_per90'], 2),
+                                            'assists_per90': round(alternative_rates['assists_per90'], 2),
+                                            'tackles_per90': round(alternative_defensive['tackles_per90'], 2),
+                                            'defensive_contrib_per90': round(alternative_defensive['defensive_contrib_per90'], 2),
+                                            'cbi_per90': round(alternative_defensive['cbi_per90'], 2),
+                                            'bps_per90': round(alternative_defensive['bps_per90'], 2),
+                                            'fixture_difficulty': alt_next.get('difficulty') if alt_next else None,
+                                            'fixture_delta': round(fixture_delta_value, 2) if fixture_delta_value is not None else None,
+                                            'implied_goals': round(alt_team_summary.get('implied_goals', 0.0), 2) if alt_team_summary else None,
+                                            'implied_conceded': round(alt_team_summary.get('implied_conceded', 1.6), 2) if alt_team_summary else None,
+                                            'ownership_delta': round(
+                                                self._get_value(alternative, 'selected_by_percent') - self._get_value(current_player, 'selected_by_percent'),
+                                                1
+                                            ),
+                                            'position': pos_code,
+                                            # Manager ML insights
+                                            'effective_ownership': round(alternative.get('effective_ownership', 0), 1),
+                                            'template_status': alternative.get('template_status', 'unknown'),
+                                            'differential_value': round(alternative.get('differential_value', 0), 1),
+                                            'current_template_status': current_player.get('template_status', 'unknown')
+                                        }
+                                    }
+                                    
+                                    # Apply ownership-based scoring adjustments (Manager ML integration)
+                                    ownership_boost = 0.0
+                                    ownership_notes = []
+                                    
+                                    # Boost if top managers are buying this player (effective ownership trending up)
+                                    alt_eo = alternative.get('effective_ownership', alternative.get('selected_by_percent', 0))
+                                    curr_eo = current_player.get('effective_ownership', current_player.get('selected_by_percent', 0))
+                                    eo_delta = alt_eo - curr_eo
+                                    
+                                    if eo_delta > 5:  # Significant ownership increase
+                                        ownership_boost += 0.3
+                                        ownership_notes.append(f"Top managers favor this (+{eo_delta:.1f}% EO)")
+                                    elif eo_delta > 2:
+                                        ownership_boost += 0.15
+                                        ownership_notes.append(f"Rising ownership among top managers")
+                                    
+                                    # Penalize selling template players (risky move)
+                                    if current_player.get('template_status') == 'template':
+                                        ownership_boost -= 0.2
+                                        ownership_notes.append("Selling template player (risky)")
+                                    
+                                    # Boost differential picks if they have good predicted points
+                                    if alternative.get('template_status') == 'differential' and points_gain >= 1.5:
+                                        ownership_boost += 0.2
+                                        ownership_notes.append("Smart differential pick")
+                                    
+                                    # Apply the ownership boost
+                                    if ownership_boost != 0:
+                                        transfer_dict['points_gain'] = round(points_gain + ownership_boost, 1)
+                                        transfer_dict['ownership_boost'] = round(ownership_boost, 2)
+                                        if ownership_notes:
+                                            transfer_dict['reason'] += " | " + "; ".join(ownership_notes)
+                                    
+                                    transfer_suggestions.append(transfer_dict)
+                                    fallback_candidates.append(transfer_dict)
                                     recommended_in_ids.add(int(alternative['id']))
                         
                         # Sort by points gain
@@ -1577,8 +2155,8 @@ class FPLOptimizer:
                         
                         # Respect user's free transfers limit
                         if use_wildcard:
-                            # On wildcard, show up to 10 suggestions
-                            result['transfer_suggestions'] = free_transfer_suggestions[:10]
+                            # On wildcard, still limit to five high-confidence moves
+                            result['transfer_suggestions'] = free_transfer_suggestions[:5]
                         else:
                             # Prioritize free transfers, then add worthwhile hits (max 2 extra)
                             final_suggestions = free_transfer_suggestions[:free_transfers]
@@ -1589,7 +2167,108 @@ class FPLOptimizer:
                                 extra_hits = [t for t in worthwhile_hit_suggestions if t['net_gain'] >= 2.0][:2]
                                 final_suggestions.extend(extra_hits)
                             
-                            result['transfer_suggestions'] = final_suggestions
+                            result['transfer_suggestions'] = final_suggestions[:5]
+                        
+                        # Fallback: if still empty, surface best raw improvements with low confidence tags
+                        if not result['transfer_suggestions']:
+                            self.logger.info("No transfer suggestions passed thresholds; using fallback recommendations.")
+                            
+                            # Less aggressive filtering - show transfers even if below ideal threshold
+                            filtered_candidates = []
+                            for cand in fallback_candidates:
+                                premium_cost = cand['player_out'].get('cost', 0)
+                                premium_points = cand['player_out'].get('predicted_points', 0)
+                                is_premium_out = premium_cost >= 9 or premium_points >= 4
+                                
+                                # Relaxed threshold: only filter if gain is very small for premium
+                                if is_premium_out and cand['points_gain'] < 0.3:  # Lowered from 2.5
+                                    continue
+                                
+                                # Tag with low confidence if below optimal threshold
+                                if cand['points_gain'] < 1.0:
+                                    cand['confidence'] = 'Low'
+                                    cand['priority'] = 'Low'
+                                    cand['reason'] += " | Low confidence - marginal gain"
+                                
+                                filtered_candidates.append(cand)
+                            
+                            fallback_candidates = filtered_candidates
+                            fallback_candidates.sort(key=lambda x: x['points_gain'], reverse=True)
+                            
+                            if not fallback_candidates:
+                                # Build basic fallback with even more relaxed filters
+                                basic_suggestions = []
+                                for _, current_player in current_team_df.iterrows():
+                                    alternatives = all_predictions[
+                                        (all_predictions['position'] == current_player['position']) &
+                                        (all_predictions['predicted_points'] > current_player['predicted_points'])
+                                    ].nlargest(3, 'predicted_points')  # Get top 3 instead of 1
+                                    
+                                    if alternatives.empty:
+                                        continue
+                                    
+                                    # Take the best alternative
+                                    alternative = alternatives.iloc[0]
+                                    gain = alternative['predicted_points'] - current_player['predicted_points']
+                                    
+                                    if gain <= 0:
+                                        continue
+                                    
+                                    # Determine confidence based on gain
+                                    if gain >= 1.0:
+                                        confidence = 'Medium'
+                                        priority = 'Medium'
+                                    else:
+                                        confidence = 'Low'
+                                        priority = 'Low'
+                                    
+                                    basic_suggestions.append({
+                                        'player_out': {
+                                            'id': int(current_player['id']),
+                                            'name': current_player['web_name'],
+                                            'web_name': current_player['web_name'],
+                                            'team_name': current_player.get('team_name', ''),
+                                            'position': current_player['position'],
+                                            'cost': current_player['now_cost'] / 10.0,
+                                            'predicted_points': round(current_player['predicted_points'], 1)
+                                        },
+                                        'player_in': {
+                                            'id': int(alternative['id']),
+                                            'name': alternative['web_name'],
+                                            'web_name': alternative['web_name'],
+                                            'team_name': alternative.get('team_name', ''),
+                                            'position': alternative['position'],
+                                            'cost': alternative['now_cost'] / 10.0,
+                                            'predicted_points': round(alternative['predicted_points'], 1)
+                                        },
+                                        'points_gain': round(gain, 1),
+                                        'priority': priority,
+                                        'confidence': confidence,
+                                        'reason': f"{alternative['web_name']} offers +{gain:.1f} pts over {current_player['web_name']}" + 
+                                                 (" | Low confidence - small gain" if confidence == 'Low' else ""),
+                                        'is_free': True,
+                                        'transfer_cost': 0,
+                                        'bench_guidance': 'Starting XI - direct upgrade',
+                                        'should_start': True
+                                    })
+                                
+                                # Only filter out extremely poor suggestions
+                                filtered_basic = []
+                                for cand in basic_suggestions:
+                                    premium_cost = cand['player_out'].get('cost', 0)
+                                    premium_points = cand['player_out'].get('predicted_points', 0)
+                                    
+                                    # Very relaxed: only filter if premium AND gain < 0.2
+                                    if (premium_cost >= 9 or premium_points >= 4) and cand['points_gain'] < 0.2:  # Lowered from 2.5
+                                        continue
+                                    
+                                    filtered_basic.append(cand)
+                                
+                                fallback_candidates = filtered_basic
+                            
+                            # Show top 3-5 transfers even if low confidence
+                            num_suggestions = max(3, min(5, free_transfers))
+                            result['transfer_suggestions'] = fallback_candidates[:num_suggestions]
                     
                 except Exception as e:
                     self.logger.error(f"Error generating transfer recommendations: {str(e)}")
@@ -1730,7 +2409,8 @@ class FPLOptimizer:
                     players_df,
                     include_fixture_analysis,
                     result.get('fixture_analysis', {}),
-                    starting_ids=starting_ids_for_analysis
+                    starting_ids=starting_ids_for_analysis,
+                    current_gw=current_gw
                 )
                 result['bench_analysis'] = bench_analysis
             else:
